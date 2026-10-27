@@ -39,21 +39,17 @@ end, clonefunction or function(...)
 	return ...
 end
 
---// Custom Drawing Library
+--// Drawing Library Check (Isaeva / sUNC)
 
-if not Drawing or not Drawing.new or not Drawing.Fonts then
-	loadstring(game.HttpGet(game, "https://pastebin.com/raw/huyiRsK0"))()
+assert(Drawing and type(Drawing.new) == "function", "EXUNYS_ESP > Drawing library is unavailable on this executor.")
 
-	repeat
-		wait(0)
-	until Drawing and Drawing.new and type(Drawing.new) == "function" and Drawing.Fonts and type(Drawing.Fonts) == "table"
-end
+print("EXUNYS_ESP > Isaeva compatibility build loaded.")
 
 --// References
 
 local ConfigLibrary = loadstring(game.HttpGet(game, "https://raw.githubusercontent.com/Exunys/Config-Library/main/Main.lua"))()
 local Vector2new, Vector3new, Vector3zero, CFramenew, Instancenew = Vector2.new, Vector3.new, Vector3.zero, CFrame.new, Instance.new
-local Drawingnew, DrawingFonts = Drawing and Drawing.new, Drawing and Drawing.Fonts
+local DrawingFonts = Drawing.Fonts or {UI = 0, System = 1, Plex = 2, Monospace = 3}
 local Color3fromRGB, Color3fromHSV = Color3.fromRGB, Color3.fromHSV
 local WorldToViewportPoint, GetPlayers, GetMouseLocation
 
@@ -72,21 +68,176 @@ local GameMetatable = getrawmetatable and getrawmetatable(game) or {
 local __index = GameMetatable.__index
 local __newindex = GameMetatable.__newindex
 
-local getrenderproperty, setrenderproperty = getrenderproperty or __index, setrenderproperty or __newindex
+--// Drawing Compatibility Layer (sUNC Drawing API)
 
-local _get, _set = LPH_NO_VIRTUALIZE(function(self, Index)
-	return self[Index]
-end), LPH_NO_VIRTUALIZE(function(self, Index, Value)
-	self[Index] = Value
+-- Every render object is created through Drawingnew so its type is known. Property writes are filtered
+-- against the sUNC property list for that type, because sUNC objects error on unknown properties
+-- (e.g. "Outline" on a Line or Square), which would kill the RenderStepped connection.
+
+local NativeDrawingnew = clonefunction(Drawing.new)
+local NativeGetProperty, NativeSetProperty = getrenderproperty, setrenderproperty
+
+local RenderTypes = setmetatable({}, {__mode = "k"})
+local QuadShims = setmetatable({}, {__mode = "k"})
+
+local BaseProperties = {Visible = true, ZIndex = true, Transparency = true, Color = true}
+
+local RenderProperties = {
+	Line = {From = true, To = true, Thickness = true},
+	Text = {Text = true, TextBounds = true, Font = true, Size = true, Position = true, Center = true, Outline = true, OutlineColor = true},
+	Image = {Data = true, Size = true, Position = true, Rounding = true},
+	Circle = {NumSides = true, Radius = true, Position = true, Thickness = true, Filled = true},
+	Square = {Size = true, Position = true, Thickness = true, Filled = true},
+	Quad = {PointA = true, PointB = true, PointC = true, PointD = true, Thickness = true, Filled = true},
+	Triangle = {PointA = true, PointB = true, PointC = true, Thickness = true, Filled = true}
+}
+
+for _, Properties in next, RenderProperties do
+	for Property in next, BaseProperties do
+		Properties[Property] = true
+	end
+end
+
+local RawGet = LPH_NO_VIRTUALIZE(function(Object, Property)
+	if NativeGetProperty then
+		return NativeGetProperty(Object, Property)
+	end
+
+	return Object[Property]
 end)
 
-if identifyexecutor() == "Solara" then
-	local DrawQuad = loadstring(game.HttpGet(game, "https://raw.githubusercontent.com/Exunys/Custom-Quad-Render-Object/main/Main.lua"))() -- Custom Quad Drawing Object
-	local _Drawingnew = clonefunction(Drawing.new)
+local RawSet = LPH_NO_VIRTUALIZE(function(Object, Property, Value)
+	if NativeSetProperty then
+		return NativeSetProperty(Object, Property, Value)
+	end
 
-	Drawingnew = LPH_NO_VIRTUALIZE(function(...)
-		return ({...})[1] == "Quad" and DrawQuad(...) or _Drawingnew(...)
-	end)
+	Object[Property] = Value
+end)
+
+local function CreateNative(Type)
+	local Object = NativeDrawingnew(Type)
+
+	RenderTypes[Object] = Type
+	RawSet(Object, "Visible", false) -- Some executors initialize render objects as visible.
+
+	return Object
+end
+
+local QuadSupported = pcall(function()
+	local Object = NativeDrawingnew("Quad")
+
+	RawSet(Object, "PointA", Vector2.zero)
+	Object:Remove()
+end)
+
+local function CreateQuadShim() -- Fallback Quad built from 4 Lines (outline only) for executors without native Quad support.
+	local Shim = {}
+	local Lines = {CreateNative("Line"), CreateNative("Line"), CreateNative("Line"), CreateNative("Line")}
+	local State = {Visible = false, ZIndex = 1, Transparency = 1, Color = Color3.new(1, 1, 1), Thickness = 1, Filled = false, PointA = Vector2.zero, PointB = Vector2.zero, PointC = Vector2.zero, PointD = Vector2.zero}
+	local Points = {"PointA", "PointB", "PointC", "PointD"}
+
+	QuadShims[Shim] = {
+		Get = function(Property)
+			return State[Property]
+		end,
+
+		Set = function(Property, Value)
+			if State[Property] == nil then
+				return
+			end
+
+			State[Property] = Value
+
+			if stringfind(Property, "^Point") then
+				for Index = 1, 4 do
+					RawSet(Lines[Index], "From", State[Points[Index]])
+					RawSet(Lines[Index], "To", State[Points[Index % 4 + 1]])
+				end
+			elseif Property ~= "Filled" then
+				for Index = 1, 4 do
+					RawSet(Lines[Index], Property, Value)
+				end
+			end
+		end,
+
+		Remove = function()
+			for Index = 1, 4 do
+				pcall(function()
+					Lines[Index]:Remove()
+				end)
+			end
+		end
+	}
+
+	Shim.Remove = function()
+		local Data = QuadShims[Shim]
+
+		if Data then
+			Data.Remove(); QuadShims[Shim] = nil
+		end
+	end
+
+	Shim.Destroy = Shim.Remove
+
+	return Shim
+end
+
+local Drawingnew = LPH_NO_VIRTUALIZE(function(Type)
+	if Type == "Quad" and not QuadSupported then
+		return CreateQuadShim()
+	end
+
+	return CreateNative(Type)
+end)
+
+local getrenderproperty = LPH_NO_VIRTUALIZE(function(Object, Property)
+	local Shim = QuadShims[Object]
+
+	if Shim then
+		return Shim.Get(Property)
+	end
+
+	local Allowed = RenderProperties[RenderTypes[Object]]
+
+	if Allowed and not Allowed[Property] then
+		return nil
+	end
+
+	return RawGet(Object, Property)
+end)
+
+local setrenderproperty = LPH_NO_VIRTUALIZE(function(Object, Property, Value)
+	local Shim = QuadShims[Object]
+
+	if Shim then
+		return Shim.Set(Property, Value)
+	end
+
+	local Allowed = RenderProperties[RenderTypes[Object]]
+
+	if (Allowed and not Allowed[Property]) or Value == nil then
+		return
+	end
+
+	RawSet(Object, Property, Value)
+end)
+
+local _get, _set = getrenderproperty, setrenderproperty
+
+local function RemoveRender(Object) -- Removes a render object, or every render object inside a (nested) table.
+	if QuadShims[Object] then
+		Object.Remove()
+	elseif RenderTypes[Object] then
+		RenderTypes[Object] = nil
+
+		pcall(function()
+			Object:Remove()
+		end)
+	elseif type(Object) == "table" then
+		for _, Value in next, Object do
+			RemoveRender(Value)
+		end
+	end
 end
 
 local _GetService = __index(game, "GetService")
@@ -893,7 +1044,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 					end
 
 					for _, Value in next, Quads do
-						_set(Value, "Fill", Fill)
+						_set(Value, "Filled", Fill)
 						_set(Value, "Color", CoreFunctions.GetColor(Entry.Object, Settings.RainbowColor and Rainbow or Settings.Color))
 					end
 
@@ -1416,8 +1567,8 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 				end)
 
 				if not Primed then
-					pcall(TopText.Remove, TopText)
-					pcall(BottomText.Remove, BottomText)
+					RemoveRender(TopText)
+					RemoveRender(BottomText)
 
 					return Disconnect(Entry.Connections.ESP)
 				end
@@ -1455,8 +1606,8 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 				end)
 
 				if not Primed then
-					pcall(Tracer.Remove, Tracer)
-					pcall(TracerOutline.Remove, TracerOutline)
+					RemoveRender(Tracer)
+					RemoveRender(TracerOutline)
 
 					return Disconnect(Entry.Connections.Tracer)
 				end
@@ -1503,8 +1654,8 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 				end)
 
 				if not Primed then
-					pcall(Circle.Remove, Circle)
-					pcall(CircleOutline.Remove, CircleOutline)
+					RemoveRender(Circle)
+					RemoveRender(CircleOutline)
 
 					return Disconnect(Entry.Connections.HeadDot)
 				end
@@ -1592,16 +1743,16 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 				if not Primed then
 					for Index, Value in next, BoxParts do
-						pcall(Value.Remove, Value)
-						pcall(BoxOutlines[Index].Remove, BoxOutlines[Index])
+						RemoveRender(Value)
+						RemoveRender(BoxOutlines[Index])
 					end
 
 					for _, Value in next, Quads do
-						pcall(Value.Remove, Value)
+						RemoveRender(Value)
 					end
 
-					pcall(SquareBox.Remove, SquareBox)
-					pcall(FillBox.Remove, FillBox)
+					RemoveRender(SquareBox)
+					RemoveRender(FillBox)
 
 					return Disconnect(Entry.Connections.Box)
 				end
@@ -1655,8 +1806,8 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 				end)
 
 				if not Primed then
-					pcall(Main.Remove, Main)
-					pcall(Outline.Remove, Outline)
+					RemoveRender(Main)
+					RemoveRender(Outline)
 
 					return Disconnect(Entry.Connections.HealthBar)
 				end
@@ -1741,7 +1892,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 				if not Primed then
 					for _, Value in next, ChamsEntry do
-						pcall(Value.Remove, Value)
+						RemoveRender(Value)
 					end
 
 					return Disconnect(Entry.Connections.Chams)
@@ -1825,7 +1976,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 			local SkeletonEntry = Entry.Visuals.Skeleton
 
-			if not type(SkeletonEntry) == "table" or not SkeletonEntry then
+			if type(SkeletonEntry) ~= "table" then
 				return warn("EXUNYS_ESP > CreatingFunctions.Skeleton (Critical Skeleton Error) - Couldn't identify Humanoid Rig Type for user \""..Entry.Name.."\". Aborted rendering.")
 			end
 
@@ -1836,7 +1987,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 				if not Primed then
 					for _, Value in next, SkeletonEntry do
-						pcall(Value.Remove, Value)
+						RemoveRender(Value)
 					end
 
 					return Disconnect(Entry.Connections.Skeleton)
@@ -2354,11 +2505,7 @@ local UtilityFunctions; LPH_NO_VIRTUALIZE(function()
 							pcall(Value.Visuals.Highlight.Destroy, Value.Visuals.Highlight); Value.Visuals.Highlight = nil
 						end
 
-						Recursive(Value.Visuals, function(_, _Value)
-							if type(_Value) == "table" and _Value then
-								pcall(_Value.Remove, _Value)
-							end
-						end)
+						RemoveRender(Value.Visuals)
 					end
 
 					Environment.UtilityAssets.WrappedObjects[Hash] = nil; break
@@ -2556,7 +2703,7 @@ Environment.Exit = function(self) -- (self) => <void>
 		end
 
 		for _, RenderObject in next, CrosshairParts do
-			pcall(RenderObject.Remove, RenderObject)
+			RemoveRender(RenderObject)
 		end
 
 		for _, Table in next, {CoreFunctions, UpdatingFunctions, CreatingFunctions, UtilityFunctions} do
@@ -2600,7 +2747,7 @@ Environment.RemoveCrosshair = function() -- (<void>) => <void>
 	pcall(Disconnect, ServiceConnections.UpdateCrosshair)
 
 	for _, RenderObject in next, CrosshairParts do
-		pcall(RenderObject.Remove, RenderObject)
+		RemoveRender(RenderObject)
 	end
 
 	CrosshairParts = {}
