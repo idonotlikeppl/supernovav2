@@ -43,7 +43,7 @@ end
 
 assert(Drawing and type(Drawing.new) == "function", "EXUNYS_ESP > Drawing library is unavailable on this executor.")
 
-print("EXUNYS_ESP > Isaeva compatibility build loaded.")
+print("EXUNYS_ESP > Isaeva compatibility build loaded (v2).")
 
 --// References
 
@@ -78,6 +78,7 @@ local NativeDrawingnew = clonefunction(Drawing.new)
 local NativeGetProperty, NativeSetProperty = getrenderproperty, setrenderproperty
 
 local RenderTypes = setmetatable({}, {__mode = "k"})
+local UnknownTypeWarned = false
 local QuadShims = setmetatable({}, {__mode = "k"})
 
 local BaseProperties = {Visible = true, ZIndex = true, Transparency = true, Color = true}
@@ -216,6 +217,17 @@ local setrenderproperty = LPH_NO_VIRTUALIZE(function(Object, Property, Value)
 	local Allowed = RenderProperties[RenderTypes[Object]]
 
 	if (Allowed and not Allowed[Property]) or Value == nil then
+		return
+	end
+
+	if not Allowed then -- Type lookup missed (executor returned a different object reference); never let a bad write kill the render loop.
+		local Success, Error = pcall(RawSet, Object, Property, Value)
+
+		if not Success and not UnknownTypeWarned then
+			UnknownTypeWarned = true
+			warn("EXUNYS_ESP > Render object type lookup failed, falling back to protected writes: "..tostring(Error))
+		end
+
 		return
 	end
 
@@ -741,7 +753,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 			if OnScreen then
 				for Index, Value in next, Settings do
-					if ValidProperties[Index] then
+					if ValidProperties[Index] and RenderProperties.Text[Index] then
 						setrenderproperty(TopTextObject, Index, Value)
 						setrenderproperty(BottomTextObject, Index, Value)
 					end
@@ -833,7 +845,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 			if OnScreen then
 				for Index, Value in next, Settings do
-					if ValidProperties[Index] then
+					if ValidProperties[Index] and RenderProperties.Line[Index] then
 						setrenderproperty(TracerObject, Index, Value)
 					end
 				end
@@ -893,7 +905,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 			if OnScreen then
 				for Index, Value in next, Settings do
-					if ValidProperties[Index] then
+					if ValidProperties[Index] and RenderProperties.Circle[Index] then
 						setrenderproperty(CircleObject, Index, Value)
 
 						if Settings.Outline then
@@ -1013,7 +1025,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 				if Type == 1 then -- Square Box
 					for Index, Value in next, Settings do
-						if ValidProperties[Index] then
+						if ValidProperties[Index] and RenderProperties.Square[Index] then
 							setrenderproperty(SquareBoxObject, Index, Value)
 						end
 					end
@@ -1037,7 +1049,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 					for Index, Value in next, Settings do
 						for _, RenderObject in next, Quads do
-							if ValidProperties[Index] then
+							if ValidProperties[Index] and RenderProperties.Quad[Index] then
 								_set(RenderObject, Index, Value)
 							end
 						end
@@ -1062,7 +1074,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 				elseif Type == 3 then -- Corner Box
 					for Index, Value in next, Settings do
 						for _, RenderObject in next, BoxParts do
-							if ValidProperties[Index] then
+							if ValidProperties[Index] and RenderProperties.Line[Index] then
 								setrenderproperty(RenderObject, Index, Value)
 							end
 						end
@@ -1151,7 +1163,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 
 			if OnScreen and Position and Size then
 				for Index, Value in next, Settings do
-					if ValidProperties[Index] then
+					if ValidProperties[Index] and RenderProperties.Line[Index] then
 						setrenderproperty(MainObject, Index, Value)
 					end
 				end
@@ -2209,7 +2221,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 								Value = CenterDotSettings.RainbowColor and Rainbow or Value
 							end
 
-							if ValidProperties[Index] or Index == "Color" then
+							if (ValidProperties[Index] or Index == "Color") and RenderProperties.Circle[Index] then
 								setrenderproperty(CenterDot, Index, Value)
 
 								if Index ~= "Color" and Index ~= "Thickness" then
