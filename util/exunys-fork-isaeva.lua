@@ -2383,7 +2383,11 @@ local UtilityFunctions; LPH_NO_VIRTUALIZE(function()
 		WrapObject = function(self, Object, PseudoName, Allowed, RenderDistance)
 			assert(self, "EXUNYS_ESP > UtilityFunctions.WrapObject - Internal error, unassigned parameter \"self\".")
 
-if Environment.Properties.Chams.Enabled then CreatingFunctions.Chams(Entry) end
+			--// Because gethiddenproperty behaves differently on Xeno and Solara, this part breaks the code. This is the universal solution.
+
+			-- if pcall(gethiddenproperty, Object, "PrimaryPart") then
+			-- 	Object = __index(Object, "PrimaryPart")
+			-- end
 
 			do
 				local Signal = {pcall(gethiddenproperty, Object, "PrimaryPart")}
