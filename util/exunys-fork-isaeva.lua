@@ -885,7 +885,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 		HeadDot = function(Entry, CircleObject, CircleOutlineObject)
 			local Settings = Environment.Properties.HeadDot
 
-			local Character = Entry.IsAPlayer and __index(Entry.Object, "Character") or __index(Entry.Object, "Parent")
+			local Character = (if Entry.IsAPlayer then __index(Entry.Object, "Character") else __index(Entry.Object, "Parent"))
 			local Head = Character and FindFirstChild(Character, "Head")
 
 			if not Head then
@@ -948,7 +948,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 			local Object = Entry.Object
 			local IsAPlayer = Entry.IsAPlayer
 
-			local Character = IsAPlayer and __index(Object, "Character") or __index(Object, "Parent")
+			local Character = (if IsAPlayer then __index(Object, "Character") else __index(Object, "Parent"))
 
 			if Character == Players then
 				return
@@ -1294,7 +1294,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 			local Settings = Environment.Properties.Skeleton
 			local DeveloperSettings = Environment.DeveloperSettings
 
-			local Character = Entry.IsAPlayer and __index(Entry.Object, "Character") or __index(Entry.Object, "Parent")
+			local Character = (if Entry.IsAPlayer then __index(Entry.Object, "Character") else __index(Entry.Object, "Parent"))
 			local Head = Character and FindFirstChild(Character, "Head")
 			local Primary = Character and (FindFirstChild(Character, "HumanoidRootPart") or __index(Character, "PrimaryPart"))
 
@@ -1512,7 +1512,7 @@ local UpdatingFunctions; LPH_NO_VIRTUALIZE(function()
 		Highlight = function(Entry, Highlight)
 			local Settings = Environment.Properties.Highlight
 
-			if not (Entry.IsAPlayer and __index(Entry.Object, "Character") or __index(Entry.Object, "Parent")) then
+			if not ((if Entry.IsAPlayer then __index(Entry.Object, "Character") else __index(Entry.Object, "Parent"))) then
 				return __newindex(Highlight, "Enabled", false)
 			end
 
@@ -2023,7 +2023,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 				return
 			end
 
-			local Character = Entry.IsAPlayer and __index(Entry.Object, "Character") or __index(Entry.Object, "Parent")
+			local Character = (if Entry.IsAPlayer then __index(Entry.Object, "Character") else __index(Entry.Object, "Parent"))
 
 			if not Character and Entry.IsAPlayer then
 				repeat
@@ -2048,7 +2048,7 @@ local CreatingFunctions; LPH_NO_VIRTUALIZE(function()
 					return Disconnect(Entry.Connections.Highlight)
 				end
 
-				Character = Entry.IsAPlayer and __index(Entry.Object, "Character") or __index(Entry.Object, "Parent")
+				Character = (if Entry.IsAPlayer then __index(Entry.Object, "Character") else __index(Entry.Object, "Parent"))
 
 				if Character and IsDescendantOf(Character, Workspace) and FindFirstChild(Character, "EXUNYS_HIGHLIGHT") then
 					if Ready then
@@ -2485,7 +2485,7 @@ local UtilityFunctions; LPH_NO_VIRTUALIZE(function()
 				CreatingFunctions.Skeleton(Entry)
 				CreatingFunctions.HeadDot(Entry)
 				CreatingFunctions.ESP(Entry)
-				--CreatingFunctions.Chams(Entry)
+				if Environment.Properties.Chams.Enabled then CreatingFunctions.Chams(Entry) end -- Heavy (6 quads per body part), so only built when enabled.
 				CreatingFunctions.Highlight(Entry)
 
 				--delay(1, CoreFunctions.ResetScreenDistortion, CoreFunctions)
