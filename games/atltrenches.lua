@@ -177,7 +177,7 @@ GameName = NameOk and GameName or "ATL Trenches"
 
 local Window = OasisUI:CreateWindow({
     Title = GameName,
-    Subtitle = "✨SuperNova💫 vInfDev",
+    Subtitle = "✨SuperNova💫",
     Folder = "shenyu_u",
     DefaultConfig = "default",
     AutoSave = true,
