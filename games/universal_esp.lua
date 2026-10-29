@@ -159,7 +159,7 @@ end
 local NameOk, GameName = pcall(function()
     return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name
 end)
-GameName = NameOk and GameName or "ATL Trenches"
+GameName = NameOk and GameName
 
 local Window = OasisUI:CreateWindow({
     Title = GameName,
