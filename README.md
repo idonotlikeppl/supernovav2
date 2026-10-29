@@ -13,8 +13,9 @@ Supernova is a personal side project built to automate the tedious, repeat-every
 3. Choose a routine from the menu, or build a new one from the available actions.
 4. Press the **Start** hotkey to begin. Press **Stop** at any time to end the routine.
 
-`lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/idonotlikeppl/supernovav2/main/loader.lua"))()`
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/idonotlikeppl/supernovav2/main/loader.lua"))()
+```
 
 ## Contributing
 
