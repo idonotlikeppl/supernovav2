@@ -295,7 +295,7 @@ local OasisUI = loadstring(game:HttpGet("https://github.com/Mold53/OasisUI/relea
 
 local Window = OasisUI:CreateWindow({
     Title = "Emergency Response: Liberty County",
-    Subtitle = "✨SuperNova💫 vInfDev",
+    Subtitle = "✨SuperNova💫",
     Folder = "shenyu_u_erlc",
     DefaultConfig = "default",
     AutoSave = true,
