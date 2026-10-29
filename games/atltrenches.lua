@@ -161,10 +161,6 @@ local function ColorBlock(Module, Name, HasMain, HasOutline)
 	return Group
 end
 
-
-local function Char()
-    return Player.Character
-end
 local settings = {
     CandyFarm = false,
     LoadMap = true,
@@ -173,8 +169,14 @@ local settings = {
     Check = false,
 }
 
+-- GetProductInfo is a web call: if it fails, the menu still opens instead of the whole script erroring
+local NameOk, GameName = pcall(function()
+    return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name
+end)
+GameName = NameOk and GameName or "ATL Trenches"
+
 local Window = OasisUI:CreateWindow({
-    Title = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name,
+    Title = GameName,
     Subtitle = "✨SuperNova💫 vInfDev",
     Folder = "shenyu_u",
     DefaultConfig = "default",
@@ -1085,16 +1087,31 @@ do
         return Humanoid == nil or Humanoid.Health > 0
     end
 
+    -- HeadHitbox is a recursive search, so remember it per character (weak: dead characters drop out)
+    local HeadHitboxes = setmetatable({}, {__mode = "k"})
+
     local function AimPartOf(Character)
         if Aim.AimPart == "Head" then
-            return Character:FindFirstChild("HeadHitbox", true) or Character:FindFirstChild("Head")
+            local Hitbox = HeadHitboxes[Character]
+
+            if not (Hitbox and Hitbox.Parent and Hitbox:IsDescendantOf(Character)) then
+                Hitbox = Character:FindFirstChild("HeadHitbox", true)
+                HeadHitboxes[Character] = Hitbox
+            end
+
+            return Hitbox or Character:FindFirstChild("Head")
         end
 
         return Character:FindFirstChild("HumanoidRootPart") or Character:FindFirstChild("UpperTorso") or Character:FindFirstChild("Torso")
     end
 
+    -- One RaycastParams, rebuilt only when what it ignores changes. Setting FilterDescendantsInstances is the
+    -- expensive part, and silent aim used to do it once per player per shot.
+    local CachedParams = RaycastParams.new()
+    CachedParams.FilterType = Enum.RaycastFilterType.Exclude
+    local CachedKey = {}
+
     local function NewParams()
-        local Params = RaycastParams.new()
         local Ignore = OwnCharacters()
 
         -- Ignore cars: rays pass through every car, so a player behind or inside one still counts as on target
@@ -1102,10 +1119,28 @@ do
             table.insert(Ignore, GameFolder:FindFirstChild("Vehicles"))
         end
 
-        Params.FilterType = Enum.RaycastFilterType.Exclude
-        Params.FilterDescendantsInstances = Ignore
+        local Changed = false
 
-        return Params
+        for Index = 1, 4 do
+            if Ignore[Index] ~= CachedKey[Index] then
+                Changed = true
+            end
+        end
+
+        if Changed then
+            local List = {}
+
+            for Index = 1, 4 do
+                if Ignore[Index] then
+                    table.insert(List, Ignore[Index])
+                end
+            end
+
+            CachedParams.FilterDescendantsInstances = List
+            CachedKey = Ignore
+        end
+
+        return CachedParams
     end
 
     -- Nothing between the camera and the part except the target itself
@@ -1250,13 +1285,27 @@ do
     end
 
     local Firing = false
+    local CircleShown = false
 
     local AimLoop = RunService.RenderStepped:Connect(function()
+        local ShowCircle = Aim.Silent and Aim.ShowFOV
+
+        -- Drawing writes go through the executor, so only touch the circle while it's on screen
+        if ShowCircle ~= CircleShown then
+            FOVCircle.Visible = ShowCircle
+            CircleShown = ShowCircle
+        end
+
+        if not (ShowCircle or Aim.Trigger) then
+            return
+        end
+
         local MousePosition = UserInputService:GetMouseLocation()
 
-        FOVCircle.Visible = Aim.Silent and Aim.ShowFOV
-        FOVCircle.Radius = Aim.FOV
-        FOVCircle.Position = MousePosition
+        if ShowCircle then
+            FOVCircle.Radius = Aim.FOV
+            FOVCircle.Position = MousePosition
+        end
 
         if not Aim.Trigger or Firing or not (mouse1press and mouse1release) or not HoldingGun() then
             return
@@ -1473,6 +1522,11 @@ do
         end
     end
 
+    -- Hoisted: building this closure inside the loop made one new function per GC object scanned
+    local function ScriptOf(Env)
+        return Env.script
+    end
+
     local function ScanClient(Script)
         local Found = {Script = Script}
 
@@ -1480,7 +1534,7 @@ do
             if type(Function) == "function" and islclosure(Function) then
                 local Success, Env = pcall(getfenv, Function)
 
-                local Owner = Success and type(Env) == "table" and (rawget(Env, "script") or select(2, pcall(function() return Env.script end)))
+                local Owner = Success and type(Env) == "table" and (rawget(Env, "script") or select(2, pcall(ScriptOf, Env)))
 
                 if Owner == Script then
                     local UpOk, Upvalues = pcall(getupvalues, Function)
@@ -1599,7 +1653,8 @@ do
         local OldNewindex
 
         OldNewindex = hookmetamethod(game, "__newindex", wrap(function(self, Key, Value)
-            if WriteHook.Filter and not WriteHook.Bypass and Key == "C0" and not (checkcaller and checkcaller()) then
+            -- Every property write in the game lands here, so the cheapest test that rules most out goes first
+            if Key == "C0" and WriteHook.Filter and not WriteHook.Bypass and not (checkcaller and checkcaller()) then
                 local Success, Drop = pcall(WriteHook.Filter, self)
 
                 if Success and Drop then
@@ -4608,26 +4663,66 @@ do
 
     --// Lighting and effects, re-applied every frame because the game sets time and effects itself
 
+    -- Effects and the atmosphere are looked up once a second instead of a dozen FindFirstChild calls every frame
+    local EffectCache, Atmosphere, LastLookup = {}, nil, 0
+    local FULL_BRIGHT_AMBIENT = Color3.fromRGB(150, 150, 150)
+
+    local function Lookup()
+        if os.clock() - LastLookup < 1 then
+            return
+        end
+
+        LastLookup = os.clock()
+        Atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+
+        for _, Names in next, EffectGroups do
+            for _, Name in next, Names do
+                local Effect = Lighting:FindFirstChild(Name)
+                EffectCache[Name] = Effect and Effect:IsA("PostEffect") and Effect or nil
+            end
+        end
+    end
+
+    local function AnyLighting()
+        return Render.FullBright or Render.NoFog or Render.NoShadows or Render.Time or Render.Tint or Render.Exposure
+            or Render.NoFlashes or Render.NoBlur or Render.NoBloom or Render.NoGrading
+    end
+
+    -- Something still holds an original we have to put back
+    local function AnySaved()
+        for _, Saved in next, Originals do
+            if next(Saved) ~= nil then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    local function SetOrRestore(Object, Property, Value)
+        if Value ~= nil and Value ~= false then
+            Set(Object, Property, Value)
+        else
+            Restore(Object, Property)
+        end
+    end
+
     local function ApplyLighting()
-        local Atmosphere = Lighting:FindFirstChildOfClass("Atmosphere")
+        -- Every option off and every original back: nothing to do this frame
+        if not AnyLighting() and not AnySaved() then
+            return
+        end
+
+        Lookup()
 
         -- One wanted value per property, so options that share a property never fight each other
-        local Ambient = (Render.Tint and Render.TintColor) or (Render.FullBright and Color3.fromRGB(150, 150, 150)) or nil
+        local Ambient = (Render.Tint and Render.TintColor) or (Render.FullBright and FULL_BRIGHT_AMBIENT) or nil
         local Clock = (Render.Time and Render.ClockTime) or (Render.FullBright and 14) or nil
 
-        for Property, Value in next, {Ambient = Ambient, OutdoorAmbient = Ambient, ClockTime = Clock, Brightness = Render.FullBright and 2 or nil} do
-            if Value ~= nil then
-                Set(Lighting, Property, Value)
-            end
-        end
-
-        for _, Property in next, {"Ambient", "OutdoorAmbient", "ClockTime", "Brightness"} do
-            local Wanted = (Property == "ClockTime" and Clock) or (Property == "Brightness" and Render.FullBright) or ((Property == "Ambient" or Property == "OutdoorAmbient") and Ambient)
-
-            if not Wanted then
-                Restore(Lighting, Property)
-            end
-        end
+        SetOrRestore(Lighting, "Ambient", Ambient)
+        SetOrRestore(Lighting, "OutdoorAmbient", Ambient)
+        SetOrRestore(Lighting, "ClockTime", Clock)
+        SetOrRestore(Lighting, "Brightness", Render.FullBright and 2 or nil)
 
         if Render.FullBright or Render.NoShadows then
             Set(Lighting, "GlobalShadows", false)
@@ -4661,9 +4756,9 @@ do
 
         for Option, Names in next, EffectGroups do
             for _, Name in next, Names do
-                local Effect = Lighting:FindFirstChild(Name)
+                local Effect = EffectCache[Name]
 
-                if Effect and Effect:IsA("PostEffect") then
+                if Effect then
                     if Render[Option] then
                         Set(Effect, "Enabled", false)
                     else
@@ -4714,6 +4809,10 @@ do
     local DisabledBob -- the Bobbing script we switched off
 
     local function ApplyBob(Character)
+        if not (Render.NoBob or DisabledBob) then
+            return
+        end
+
         local Client = Character and Character:FindFirstChild("CharacterClient")
         local Bob = Client and Client:FindFirstChild("Bobbing")
         local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
@@ -5238,34 +5337,93 @@ do
     end)
 end
 
--- Loads the saved config only now that every card exists; the farm setup below can yield forever
+-- Loads the saved config only now that every card exists
 Window:LoadAutoload()
 
-local CandyFolder = Workspace:WaitForChild("HalloweenCandies")
-local TargetsFolder = Workspace:FindFirstChild("Map"):FindFirstChild("AimTargets")
-local AimImprovEvent = Remotes:WaitForChild("Misc"):WaitForChild("HitAimTarget")
+--// Farms: candy, aim stat, daily check
 
+-- These used to sit behind WaitForChild("HalloweenCandies") with no timeout, so once the event folder was gone
+-- the aim farm and the daily check never started. Each one now finds what it needs on its own, and every loop
+-- stops on unload instead of running on after the menu is gone.
+local FarmsRunning = true
+local FarmConnections = {}
 
-game:GetService("RunService").RenderStepped:Connect(function()
+OasisUI:OnUnload(function()
+    FarmsRunning = false
 
-    if settings.CandyFarm == true and CandyFolder then
-        local Candies = CandyFolder:GetChildren()
-        if #Candies >= 1 and (Char() and Char():FindFirstChild("HumanoidRootPart")) then
-            for i,v in pairs(Candies) do
-                firetouchinterest(Char().HumanoidRootPart, v.Hitbox, 0)
-	            firetouchinterest(Char().HumanoidRootPart, v.Hitbox, 1)
+    for _, Connection in next, FarmConnections do
+        Connection:Disconnect()
+    end
+end)
+
+local function CandyFolder()
+    return Workspace:FindFirstChild("HalloweenCandies")
+end
+
+-- Candy farm: touch every candy's hitbox. 10 passes a second instead of every frame: a touch takes a round
+-- trip to the server before the candy goes, so touching faster only repeated the same touches.
+task.spawn(function()
+    while FarmsRunning do
+        if settings.CandyFarm then
+            local Folder = CandyFolder()
+            local Character = Player.Character
+            local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+
+            if Folder and Root then
+                for _, Candy in next, Folder:GetChildren() do
+                    local Hitbox = Candy:FindFirstChild("Hitbox")
+
+                    if Hitbox then
+                        firetouchinterest(Root, Hitbox, 0)
+                        firetouchinterest(Root, Hitbox, 1)
+                    end
+                end
             end
         end
+
+        task.wait(settings.CandyFarm and 0.1 or 0.5)
+    end
+end)
+
+-- Aim farm: hit every aim target. The old RenderStepped version started a new round of InvokeServer calls every
+-- frame without waiting for the last one, so calls piled up by the hundreds. Now one round is in flight at a time.
+task.spawn(function()
+    local HitAimTarget = Remotes:WaitForChild("Misc"):WaitForChild("HitAimTarget", 30)
+
+    if not HitAimTarget then
+        return warn("SuperNova > Remotes.Misc.HitAimTarget not found, the aim farm will not run.")
     end
 
-    if settings.GunFarm == true and TargetsFolder then
-        pcall(function() for i,v in pairs(TargetsFolder:GetChildren()) do
-                local HitPart = v:GetChildren()[2]
-                AimImprovEvent:InvokeServer(HitPart)
+    while FarmsRunning do
+        local Map = Workspace:FindFirstChild("Map")
+        local Targets = Map and Map:FindFirstChild("AimTargets")
+
+        if settings.GunFarm and Targets then
+            local Pending = 0
+
+            for _, Target in next, Targets:GetChildren() do
+                local HitPart = Target:GetChildren()[2]
+
+                if HitPart then
+                    Pending += 1
+
+                    task.spawn(function()
+                        pcall(HitAimTarget.InvokeServer, HitAimTarget, HitPart)
+                        Pending -= 1
+                    end)
+                end
             end
-        end)
-    end
 
+            -- Wait for the round to come back, but don't hang on a call the server never answers
+            local Started = os.clock()
+
+            repeat
+                task.wait()
+            until Pending <= 0 or not FarmsRunning or os.clock() - Started > 5
+        else
+            task.wait(0.5)
+        end
+    end
 end)
 
 -- Map loading for the candy farm. With streaming on, only the area around you exists on your client, so
@@ -5273,7 +5431,6 @@ end)
 -- off you. (Moving ReplicationFocus to other players, like spectate does, lets your own area unload, and the
 -- game pauses your character until it's back: that was the random freezing.)
 task.spawn(function()
-
     local function Spots()
         local List = {}
 
@@ -5299,25 +5456,32 @@ task.spawn(function()
         return List
     end
 
+    local function Loading()
+        return FarmsRunning and settings.CandyFarm and settings.LoadMap
+    end
+
+    local function CandiesLeft()
+        local Folder = CandyFolder()
+        return Folder ~= nil and #Folder:GetChildren() > 0
+    end
+
     -- Stay for the set time, and a little longer while candies that loaded in are still being picked up
     local function StayInArea()
         local Started = os.clock()
 
-        while settings.CandyFarm and settings.LoadMap and os.clock() - Started < settings.AreaTime do
+        while Loading() and os.clock() - Started < settings.AreaTime do
             task.wait(0.25)
         end
 
         local Extra = os.clock()
 
-        while settings.CandyFarm and #CandyFolder:GetChildren() > 0 and os.clock() - Extra < settings.AreaTime do
+        while FarmsRunning and settings.CandyFarm and CandiesLeft() and os.clock() - Extra < settings.AreaTime do
             task.wait(0.25)
         end
     end
 
-    while true do
-        local Active = settings.CandyFarm and settings.LoadMap
-
-        if not Active then
+    while FarmsRunning do
+        if not Loading() then
             CandyArea:SetValue("-")
             task.wait(1)
         elseif not Workspace.StreamingEnabled then
@@ -5326,7 +5490,7 @@ task.spawn(function()
         else
             -- Around other players first (they're spread over the map), then fixed spots
             for _, Other in next, Players:GetPlayers() do
-                if not (settings.CandyFarm and settings.LoadMap) then
+                if not Loading() then
                     break
                 end
 
@@ -5341,7 +5505,7 @@ task.spawn(function()
 
             -- Fixed spots across the map
             for _, Spot in next, Spots() do
-                if not (settings.CandyFarm and settings.LoadMap) then
+                if not Loading() then
                     break
                 end
 
@@ -5349,6 +5513,9 @@ task.spawn(function()
                 pcall(Player.RequestStreamAroundAsync, Player, Spot[2], 2)
                 StayInArea()
             end
+
+            -- No players and no spots: don't spin
+            task.wait()
         end
     end
 end)
@@ -5364,25 +5531,37 @@ task.spawn(function()
 
     local Start = Candies.Value
 
-    local function Update()
-        local Gained = math.max(Candies.Value - Start, 0)
-        local Text = tostring(math.floor(Gained)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
-        local Total = tostring(math.floor(Candies.Value)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+    local function Commas(Number)
+        return (tostring(math.floor(Number)):reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+    end
 
-        CandyLoaded:SetValue(Text)
-        CandyTotal:SetValue(Total)
+    local function Update()
+        CandyLoaded:SetValue(Commas(math.max(Candies.Value - Start, 0)))
+        CandyTotal:SetValue(Commas(Candies.Value))
     end
 
     Update()
-    Candies.Changed:Connect(Update)
+    table.insert(FarmConnections, Candies.Changed:Connect(Update))
 end)
 
-local CheckNotif = Remotes:WaitForChild("Misc"):WaitForChild("ShowDailyCheckUI")
+-- Daily check
+task.spawn(function()
+    local Misc = Remotes:WaitForChild("Misc")
+    local CheckNotif = Misc:WaitForChild("ShowDailyCheckUI")
 
-CheckNotif.OnClientEvent:Connect(function()
-    if not settings.Check then
+    if not FarmsRunning then
         return
     end
 
-    Remotes:WaitForChild("Misc"):WaitForChild("ClaimDailyCheck"):FireServer()
+    table.insert(FarmConnections, CheckNotif.OnClientEvent:Connect(function()
+        if not settings.Check then
+            return
+        end
+
+        local Claim = Misc:FindFirstChild("ClaimDailyCheck")
+
+        if Claim then
+            Claim:FireServer()
+        end
+    end))
 end)
