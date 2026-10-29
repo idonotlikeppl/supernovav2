@@ -81,7 +81,7 @@ GameName = NameOk and GameName or "NATO vs PACT"
 
 local Window = OasisUI:CreateWindow({
     Title = GameName,
-    Subtitle = "✨SuperNova💫 Front",
+    Subtitle = "✨SuperNova💫",
     Folder = "shenyu_u_front", -- its own config folder, separate from the ATL script's
     DefaultConfig = "default",
     AutoSave = true,
