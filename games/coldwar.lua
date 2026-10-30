@@ -62,6 +62,41 @@ local function Require(Module)
     return Ok and Result or nil
 end
 
+-- Vehicle seats here aren't Roblox seats: each carries the FactoryVehicleSeat tag and an Occupant ObjectValue
+-- holding the character in it (Shared.Vehicle.VehicleController), so Humanoid.SeatPart stays empty
+local function SeatOf(Character)
+    if not Character then
+        return nil
+    end
+
+    for _, Seat in next, game:GetService("CollectionService"):GetTagged("FactoryVehicleSeat") do
+        local Occupant = Seat:FindFirstChild("Occupant")
+
+        if Occupant and Occupant:IsA("ObjectValue") and Occupant.Value == Character then
+            return Seat
+        end
+    end
+
+    return nil
+end
+
+-- The vehicle a seat belongs to: the seat's grandparent model with a RootPart, as the game finds it
+local function VehicleOfSeat(Seat)
+    local Model = Seat and Seat.Parent and Seat.Parent.Parent
+
+    if Model and Model:IsA("Model") and Model:FindFirstChild("RootPart") then
+        return Model
+    end
+
+    local Node = Seat
+
+    while Node and Node.Parent and Node.Parent ~= Workspace and not Node.Parent:IsA("Folder") do
+        Node = Node.Parent
+    end
+
+    return Node ~= Seat and Node or nil
+end
+
 -- Freecam reads its permission from attributes on this folder (the server fills it for staff)
 local function PrivateAttributes()
     local Gui = Player:FindFirstChildOfClass("PlayerGui")
@@ -81,7 +116,7 @@ GameName = NameOk and GameName or "NATO vs PACT"
 
 local Window = OasisUI:CreateWindow({
     Title = GameName,
-    Subtitle = "✨SuperNova💫",
+    Subtitle = "✨SuperNova💫 Front",
     Folder = "shenyu_u_front", -- its own config folder, separate from the ATL script's
     DefaultConfig = "default",
     AutoSave = true,
@@ -103,6 +138,7 @@ local EspTab = Visual:SubTab({Title = "Players", Icon = "scan"})
 local IntelTab = Visual:SubTab({Title = "Radar", Icon = "radar"})
 local WorldTab = Visual:SubTab({Title = "World", Icon = "globe"})
 local ClarityTab = Visual:SubTab({Title = "Effects", Icon = "sparkles"})
+local AlertTab = Visual:SubTab({Title = "Alerts", Icon = "triangle-alert"})
 
 local Movement = Window:Tab({Title = "Movement", Icon = "wind"})
 local MoveTab = Movement:SubTab({Title = "Movement", Icon = "wind"})
@@ -139,8 +175,25 @@ do
         Lead = true,
         MaxDistance = 2000,
         ShowFOV = true,
-        Turrets = false
+        Turrets = false,
+        Wallbang = false,
+        MinPower = 0.35,
+        Ricochet = false,
+        MinChance = 0.6,
+        Indicator = true,
+        SeedPick = false,
+        Preview = true,
+        ShowAll = false
     }
+
+    local CollectionService = game:GetService("CollectionService")
+    local Ballistics = Shared and Shared:FindFirstChild("Ballistics")
+    local Materials = Require(Ballistics and Ballistics:FindFirstChild("ProjectileMaterials"))
+    local Water = Require(Shared and Shared:FindFirstChild("Water"))
+
+    -- ProfileRegistry's default: a pierced bullet never drops below 10% of its speed
+    local PIERCE_FLOOR = 0.1
+    local LIMBS = {"Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg"}
 
     local function IsDowned(Character)
         local Values = Character:FindFirstChild("CharacterValues")
@@ -158,13 +211,37 @@ do
         return Other ~= Player and Other.Team ~= nil and Player.Team ~= nil and Other.Team ~= Player.Team
     end
 
-    -- R6 rigs; the hit codec also knows the R15 torso names, so fall back through those
-    local function AimPart(Character)
+    -- The parts a hitbox mode may shoot at. R6 rigs; the hit codec also knows the R15 torso names, so fall back through those
+    local function Candidates(Character)
         if Aim.Part == "Head" then
-            return Character:FindFirstChild("Head") or Character:FindFirstChild("HumanoidRootPart")
+            return {Character:FindFirstChild("Head") or Character:FindFirstChild("HumanoidRootPart")}
+        elseif Aim.Part == "Torso" then
+            return {Character:FindFirstChild("Torso") or Character:FindFirstChild("UpperTorso") or Character:FindFirstChild("HumanoidRootPart")}
         end
 
-        return Character:FindFirstChild("Torso") or Character:FindFirstChild("UpperTorso") or Character:FindFirstChild("HumanoidRootPart")
+        local List = {}
+
+        for _, Name in next, LIMBS do
+            local Part = Character:FindFirstChild(Name)
+
+            if Part and Part:IsA("BasePart") then
+                table.insert(List, Part)
+            end
+        end
+
+        return List
+    end
+
+    -- Each limb carries its own Health value (MaxHealth as an attribute); 1 is untouched, 0 is destroyed
+    local function LimbLeft(Part)
+        local Health = Part:FindFirstChild("Health")
+
+        if Health and Health:IsA("ValueBase") and type(Health.Value) == "number" then
+            local Max = tonumber(Health:GetAttribute("MaxHealth")) or 100
+            return math.clamp(Health.Value / math.max(Max, 1), 0, 1)
+        end
+
+        return 1
     end
 
     local VisibilityParams = RaycastParams.new()
@@ -173,15 +250,7 @@ do
 
     -- The whole vehicle you're sitting in, so a turret's own hull doesn't block its line of sight
     local function MyVehicle()
-        local Character = Player.Character
-        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
-        local Node = Humanoid and Humanoid.SeatPart
-
-        while Node and Node.Parent and Node.Parent ~= Workspace and not Node.Parent:IsA("Folder") do
-            Node = Node.Parent
-        end
-
-        return Node
+        return VehicleOfSeat(SeatOf(Player.Character))
     end
 
     -- Same things the gun's own raycast skips: you, the Ignore folder, and the camera (viewmodel)
@@ -203,37 +272,389 @@ do
         return Result == nil or Result.Instance:IsDescendantOf(Character)
     end
 
-    -- The enemy part nearest the crosshair, inside the FOV circle
-    local function PickTarget(Origin)
-        local Camera = Workspace.CurrentCamera
-        local Mouse = UserInputService:GetMouseLocation()
-        local Best, BestCharacter, BestGap = nil, nil, Aim.FOV
+    -- How deep the bullet travels inside a part: cast back at it alone from past its far side, like the game's FindExit
+    local ExitParams = RaycastParams.new()
+    ExitParams.FilterType = Enum.RaycastFilterType.Include
 
-        if Aim.VisibleOnly then
-            RefreshVisibilityFilter()
+    local function Depth(Part, Entry, Direction)
+        local Reach = math.min(Part.Size.Magnitude + 1, 200)
+        ExitParams.FilterDescendantsInstances = {Part}
+
+        local Result = Workspace:Raycast(Entry + Direction * Reach, -Direction * Reach, ExitParams)
+        return Result and (Result.Position - Entry).Magnitude or Reach
+    end
+
+    local PenParams = RaycastParams.new()
+    PenParams.FilterType = Enum.RaycastFilterType.Exclude
+    PenParams.IgnoreWater = false
+
+    -- Shared.Ballistics.Interactions, walked along a straight line: the bullet starts with its weapon's Penetration
+    -- as a budget, each wall costs its thickness times the material's penetration value (people cost 0.3), and
+    -- speed falls with the share of budget spent. A part with a PenThreshold attribute lets the bullet through at any
+    -- thickness if the weapon's Penetration reaches it and stops it otherwise. Water, helmets and body armour stop it.
+    -- Returns the share of speed left when the bullet reaches the target, or nil if it never does.
+    local function Penetrates(Origin, Part, Character, Penetration)
+        if not (Materials and Penetration and Penetration > 0) then
+            return nil
         end
 
-        for _, Other in next, Players:GetPlayers() do
-            local Character = IsEnemy(Other) and Other.Character
+        local Ignore = table.clone(VisibilityParams.FilterDescendantsInstances)
+        local From, Budget, Left, Draws = Origin, Penetration, 1, 0
 
-            if Character and Alive(Character) and not (Aim.SkipDowned and IsDowned(Character)) then
-                local Part = AimPart(Character)
+        -- The game stops counting at 16 walls
+        for _ = 1, 16 do
+            PenParams.FilterDescendantsInstances = Ignore
 
-                if Part and (Part.Position - Origin).Magnitude <= Aim.MaxDistance then
-                    local Screen, OnScreen = Camera:WorldToViewportPoint(Part.Position)
+            local Result = Workspace:Raycast(From, Part.Position - From, PenParams)
 
-                    if OnScreen then
-                        local Gap = (Vector2.new(Screen.X, Screen.Y) - Mouse).Magnitude
+            if not Result or Result.Instance:IsDescendantOf(Character) then
+                return Left, Draws
+            end
 
-                        if Gap <= BestGap and (not Aim.VisibleOnly or Visible(Origin, Part, Character)) then
-                            Best, BestCharacter, BestGap = Part, Character, Gap
+            local Hit = Result.Instance
+            local Direction = (Part.Position - From).Unit
+
+            if Water and Water.isWater(Hit, Result.Material) or Result.Material == Enum.Material.Water then
+                return nil
+            end
+
+            local Accessory = Hit:FindFirstAncestorOfClass("Accessory")
+
+            if Accessory and (Accessory.Name == "CustomHelmet" or Accessory.Name == "CustomArmor") then
+                return nil
+            end
+
+            -- Root parts and phantom-tagged parts let bullets through for free
+            if Hit.Name ~= "HumanoidRootPart" and not CollectionService:HasTag(Hit, "BallisticsPhantom") then
+                local Model = Hit:FindFirstAncestorOfClass("Model")
+                local Person = Model ~= nil and Model:FindFirstChildOfClass("Humanoid") ~= nil
+                local Cost = Depth(Hit, Result.Position, Direction) * (Person and 0.3 or Materials.getPenetration(Hit.Material))
+                local Threshold = Hit:GetAttribute("PenThreshold")
+
+                if type(Threshold) == "number" then
+                    if Penetration < Threshold then
+                        return nil
+                    end
+                elseif Budget <= 0 or Cost > Budget then
+                    return nil
+                elseif Cost > 1e-3 then
+                    -- An ordinary pierce wobbles the bullet with three draws from the shot's random generator
+                    Draws += 1
+                end
+
+                Left *= math.max(1 - math.clamp(Cost / math.max(Budget, 0.001), 0, 1), PIERCE_FLOOR)
+                Budget -= Cost
+            end
+
+            table.insert(Ignore, Hit)
+            From = Result.Position
+        end
+
+        return nil
+    end
+
+    -- Visible, or (with wallbang on) reachable through the walls between with enough speed left over.
+    -- Also returns how many wobbling pierces the bullet goes through on the way.
+    local function Reach(Origin, Part, Character, Penetration)
+        if not Aim.VisibleOnly or Visible(Origin, Part, Character) then
+            return 1, 0
+        end
+
+        if Aim.Wallbang then
+            local Left, Draws = Penetrates(Origin, Part, Character, Penetration)
+
+            if Left and Left >= Aim.MinPower then
+                return Left, Draws
+            end
+        end
+
+        return nil
+    end
+
+    -- Picks the part to shoot on one enemy: the hitbox, the limb nearest the crosshair, or the most damaged limb
+    local function ChoosePart(Character, Origin, Penetration, Camera, Mouse)
+        local Best, BestPower, BestGap, BestScore, BestDraws
+
+        for _, Part in next, Candidates(Character) do
+            if (Part.Position - Origin).Magnitude <= Aim.MaxDistance then
+                local Screen, OnScreen = Camera:WorldToViewportPoint(Part.Position)
+                local Gap = OnScreen and (Vector2.new(Screen.X, Screen.Y) - Mouse).Magnitude
+
+                if Gap and Gap <= Aim.FOV then
+                    -- Most wounded skips limbs already at zero, which take no more damage
+                    local Left = LimbLeft(Part)
+                    local Score = if Aim.Part == "Most wounded" then (Left > 0 and Left or 2) else Gap
+
+                    if not BestScore or Score < BestScore then
+                        local Power, Draws = Reach(Origin, Part, Character, Penetration)
+
+                        if Power then
+                            Best, BestPower, BestGap, BestScore, BestDraws = Part, Power, Gap, Score, Draws
                         end
                     end
                 end
             end
         end
 
-        return Best, BestCharacter
+        return Best, BestPower, BestGap, BestDraws
+    end
+
+    -- The enemy nearest the crosshair inside the FOV circle, and the part to shoot on them.
+    -- Also returns the share of bullet speed left on arrival: 1 in the open, less through a wall.
+    local function PickTarget(Origin, Penetration)
+        local Camera = Workspace.CurrentCamera
+        local Mouse = UserInputService:GetMouseLocation()
+        local Best, BestCharacter, BestPower, BestGap, BestDraws = nil, nil, nil, math.huge, 0
+
+        RefreshVisibilityFilter()
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = IsEnemy(Other) and Other.Character
+
+            if Character and Alive(Character) and not (Aim.SkipDowned and IsDowned(Character)) then
+                local Part, Power, Gap, Draws = ChoosePart(Character, Origin, Penetration, Camera, Mouse)
+
+                if Part and Gap < BestGap then
+                    Best, BestCharacter, BestPower, BestGap, BestDraws = Part, Character, Power, Gap, Draws
+                end
+            end
+        end
+
+        return Best, BestCharacter, BestPower, BestDraws
+    end
+
+    -- Ricochet shots (Interactions.tryRicochet): a bullet that can't pierce a surface may glance off it. The chance is
+    -- how flat it strikes (0 head-on, 1 grazing) times its speed share times the material's ricochet value, and the
+    -- new path is the mirror reflection plus a small random wobble that shrinks the flatter the hit. A part with a
+    -- PenThreshold above the weapon's Penetration always deflects. So: find walls near the line to a hidden enemy,
+    -- mirror the enemy across each wall, and aim at the mirror image; the bounce then carries the bullet onto them.
+    local BOUNCE_YAW = {-50, -36, -24, -14, -7, 7, 14, 24, 36, 50}
+    local BOUNCE_PITCH = {0, -5}
+    local LastBounce = {At = 0}
+
+    local function BounceOff(Origin, Target, Character, Speed, K, Penetration, Direction)
+        local Result = Workspace:Raycast(Origin, Direction * Aim.MaxDistance, VisibilityParams)
+
+        if not Result or Result.Instance:FindFirstAncestorOfClass("Model") and Result.Instance:FindFirstAncestorOfClass("Model"):FindFirstChildOfClass("Humanoid") then
+            return nil
+        end
+
+        local Hit, Normal = Result.Instance, Result.Normal
+        local Side = (Target - Result.Position):Dot(Normal)
+
+        if Side < 0.5 or Water and Water.isWater(Hit, Result.Material) then
+            return nil
+        end
+
+        local Mirror = Target - 2 * Side * Normal
+        local Check = Workspace:Raycast(Origin, Mirror - Origin, VisibilityParams)
+
+        -- The aim at the mirror image has to land on the same face of the same part
+        if not Check or Check.Instance ~= Hit or Check.Normal:Dot(Normal) < 0.995 then
+            return nil
+        end
+
+        local Incoming = (Check.Position - Origin).Unit
+        local Flatness = math.clamp(math.deg(math.acos(math.clamp(-Incoming:Dot(Normal), 0, 1))) / 90, 0, 1)
+        local Travelled = (Check.Position - Origin).Magnitude
+        local SpeedShare = math.clamp(1 - K * Travelled / Speed, 0, 1)
+        local Threshold = Hit:GetAttribute("PenThreshold")
+        local Chance, Forced
+
+        if type(Threshold) == "number" and (Penetration or 0) < Threshold then
+            Chance, Forced = 1, true
+        else
+            -- A wall thin enough to pierce never bounces
+            if type(Threshold) == "number" or Depth(Hit, Check.Position, Incoming) * Materials.getPenetration(Hit.Material) <= (Penetration or 0) then
+                return nil
+            end
+
+            Chance = Flatness * SpeedShare * Materials.getRicochet(Hit.Material)
+        end
+
+        -- With seed picking the roll is ours to win, so long odds are fine
+        if Chance < (Aim.SeedPick and math.min(Aim.MinChance, 0.15) or Aim.MinChance) then
+            return nil
+        end
+
+        -- The second leg must be open
+        local Leg = Workspace:Raycast(Check.Position + Normal * 0.05, Target - Check.Position, VisibilityParams)
+
+        if Leg and not Leg.Instance:IsDescendantOf(Character) then
+            return nil
+        end
+
+        -- The bounce wobbles by up to 8 degrees, less the flatter the hit
+        return Check.Position, Chance, Forced, math.rad(8) * (1 - Flatness)
+    end
+
+    -- The best bounce onto one enemy: walls sampled in a fan around the line to them, plus the floor just short
+    local function BestBounceFor(Origin, Part, Character, Speed, K, Penetration)
+        local Root = Character:FindFirstChild("HumanoidRootPart")
+        local Target = Part.Position
+        local BestPoint, BestChance, BestForced, BestWobble
+
+        if Aim.Lead and Root then
+            Target += Root.AssemblyLinearVelocity * ((Target - Origin).Magnitude / Speed)
+        end
+
+        local Line = CFrame.lookAt(Origin, Target)
+        local Directions = {}
+
+        for _, Pitch in next, BOUNCE_PITCH do
+            for _, Yaw in next, BOUNCE_YAW do
+                table.insert(Directions, (Line * CFrame.Angles(math.rad(Pitch), math.rad(Yaw), 0)).LookVector)
+            end
+        end
+
+        for _, Pitch in next, {-8, -16} do
+            table.insert(Directions, (Line * CFrame.Angles(math.rad(Pitch), 0, 0)).LookVector)
+        end
+
+        for _, Direction in next, Directions do
+            local Point, Chance, Forced, Wobble = BounceOff(Origin, Target, Character, Speed, K, Penetration, Direction)
+
+            if Point and (not BestChance or Chance > BestChance) then
+                BestPoint, BestChance, BestForced, BestWobble = Point, Chance, Forced, Wobble
+            end
+        end
+
+        return BestPoint, BestChance, BestForced, BestWobble
+    end
+
+    local Paths = {} -- the ricochet map's latest finds: {Point, Part, Chance, Sure}
+
+    local function FindBounce(Origin, Speed, K, Penetration)
+        if not ((Aim.Ricochet or Aim.ShowAll) and Materials and Speed > 0) then
+            return nil
+        end
+
+        -- A burst asks every few frames; the walls haven't moved
+        if os.clock() - LastBounce.At < 0.15 and LastBounce.Origin and (LastBounce.Origin - Origin).Magnitude < 0.5 then
+            return LastBounce.Point, LastBounce.Character, LastBounce.Chance, LastBounce.Part, LastBounce.Forced, LastBounce.Wobble
+        end
+
+        local Camera = Workspace.CurrentCamera
+        local Mouse = UserInputService:GetMouseLocation()
+        local Hidden = {}
+
+        RefreshVisibilityFilter()
+
+        -- A bounce drawn by the ricochet map counts as in your FOV when either end of it is: the enemy, or the
+        -- point on the wall it glances off
+        local WallGap = {}
+
+        for _, Path in next, Aim.ShowAll and Paths or {} do
+            local Character = Path[2].Parent
+            local Screen, OnScreen = Camera:WorldToViewportPoint(Path[1])
+
+            if Character and OnScreen then
+                WallGap[Character] = (Vector2.new(Screen.X, Screen.Y) - Mouse).Magnitude
+            end
+        end
+
+        -- Enemies inside the FOV circle, nearest the crosshair first, with no straight shot
+        for _, Other in next, Players:GetPlayers() do
+            local Character = IsEnemy(Other) and Other.Character
+
+            if Character and Alive(Character) and not (Aim.SkipDowned and IsDowned(Character)) then
+                local Part = Candidates(Character)[1]
+
+                if Part and (Part.Position - Origin).Magnitude <= Aim.MaxDistance then
+                    local Screen, OnScreen = Camera:WorldToViewportPoint(Part.Position)
+                    local Gap = OnScreen and (Vector2.new(Screen.X, Screen.Y) - Mouse).Magnitude or math.huge
+                    Gap = math.min(Gap, WallGap[Character] or math.huge)
+
+                    if Gap <= Aim.FOV and not Visible(Origin, Part, Character) then
+                        table.insert(Hidden, {Part = Part, Character = Character, Gap = Gap})
+                    end
+                end
+            end
+        end
+
+        table.sort(Hidden, function(A, B) return A.Gap < B.Gap end)
+
+        local BestPoint, BestCharacter, BestChance, BestPart, BestForced, BestWobble
+
+        for Index = 1, math.min(#Hidden, 3) do
+            local Entry = Hidden[Index]
+            local Point, Chance, Forced, Wobble = BestBounceFor(Origin, Entry.Part, Entry.Character, Speed, K, Penetration)
+
+            if Point then
+                BestPoint, BestCharacter, BestChance, BestPart, BestForced, BestWobble = Point, Entry.Character, Chance, Entry.Part, Forced, Wobble
+                break
+            end
+        end
+
+        LastBounce = {At = os.clock(), Origin = Origin, Point = BestPoint, Character = BestCharacter, Chance = BestChance, Part = BestPart, Forced = BestForced, Wobble = BestWobble}
+        return BestPoint, BestCharacter, BestChance, BestPart, BestForced, BestWobble
+    end
+
+    -- Seed picking: every pellet's seed is chosen by the firing client (ClientFire falls back to math.random when
+    -- none is given), sent whole as a u32, and the server replays the bullet with Random.new(seed). The same seed
+    -- gives the same draws here. Interactions pulls from it in a fixed order: three draws per ordinary pierce for
+    -- the wobble, then for a bounce one roll (the bounce happens when it lands under the chance) and three more for
+    -- its wobble. So try a few hundred seeds and keep the ones whose draws give the best flight.
+    local SEED_TRIES = 300
+
+    local function Wobble(Generator)
+        return Vector3.new(Generator:NextNumber() * 2 - 1, Generator:NextNumber() * 2 - 1, Generator:NextNumber() * 2 - 1).Magnitude
+    end
+
+    local function PickSeeds(Count, Score)
+        local Pool = {}
+
+        for _ = 1, SEED_TRIES do
+            local Seed = math.random(0, 2147483647)
+            local Value = Score(Random.new(Seed))
+
+            if Value then
+                table.insert(Pool, {Seed, Value})
+            end
+        end
+
+        table.sort(Pool, function(A, B) return A[2] < B[2] end)
+
+        local Seeds = table.create(Count)
+
+        for Index = 1, Count do
+            Seeds[Index] = Pool[Index] and Pool[Index][1] or math.random(0, 2147483647)
+        end
+
+        return Seeds
+    end
+
+    -- Straightest flight through Draws pierces
+    local function PierceSeeds(Count, Draws)
+        return PickSeeds(Count, function(Generator)
+            local Worst = 0
+
+            for _ = 1, Draws do
+                Worst = math.max(Worst, Wobble(Generator))
+            end
+
+            return Worst
+        end)
+    end
+
+    -- A won roll (with a margin for error in the chance estimate), then the smallest wobble
+    local function BounceSeeds(Count, Chance, Forced, Spread)
+        return PickSeeds(Count, function(Generator)
+            if not Forced and Generator:NextNumber() >= Chance * 0.7 then
+                return nil
+            end
+
+            return Spread > 0.001 and Wobble(Generator) or 0
+        end)
+    end
+
+    -- Ballistics for a weapon by name: speed, drag and penetration from the same config the game builds the bullet from
+    local function BulletOf(WeaponName, MuzzleIndex, BulletIndex)
+        local Config = WeaponManager and WeaponManager:GetMuzzleConfig(WeaponName, MuzzleIndex or 1)
+        local Bullet = Config and type(Config.BulletSettings) == "table" and Config.BulletSettings[BulletIndex or 1]
+
+        -- Drag 1 is the game's own default when it's missing
+        return Bullet and tonumber(Bullet.MuzzleVelocity) or 0, Bullet and tonumber(Bullet.Drag) or 1, Bullet and tonumber(Bullet.Penetration) or 0
     end
 
     -- The game's bullet model (Shared.Ballistics.Trajectory): forward distance v/K * (1 - e^(-K*t)) along the aim,
@@ -321,7 +742,7 @@ do
         end
 
         if #Found > 0 then
-            ShotHook = {Count = #Found}
+            ShotHook = {Count = #Found, Seeds = true}
             getgenv().SuperNovaFrontShotHook = ShotHook
 
             for _, Function in next, Found do
@@ -330,10 +751,17 @@ do
                     local Handler = ShotHook.Handler
 
                     if Handler and typeof(Origin) == "Vector3" and type(Directions) == "table" and #Directions > 0 then
-                        local Ok, New = pcall(Handler, Tool, MuzzleIndex, BulletIndex, Origin, Directions)
+                        local Ok, New, Seeds = pcall(Handler, Tool, MuzzleIndex, BulletIndex, Origin, Directions)
 
                         if Ok and New then
                             Directions = New
+                        end
+
+                        -- Chosen seeds go in the options, where ClientFire looks before rolling its own
+                        if Ok and type(Seeds) == "table" then
+                            local Copy = type(Options) == "table" and table.clone(Options) or {}
+                            Copy.Seeds = Seeds
+                            Options = Copy
                         end
                     end
 
@@ -346,7 +774,8 @@ do
 
     if ShotHook then
         ShotHook.Handler = function(Tool, MuzzleIndex, BulletIndex, Origin, Directions)
-            if not Aim.Enabled then
+            -- Seed picking also works on its own: with silent aim off it only swaps seeds on shots you aimed yourself
+            if not (Aim.Enabled or Aim.SeedPick) then
                 return nil
             end
 
@@ -358,11 +787,7 @@ do
                 return nil
             end
 
-            -- Ballistics come from the same config the game builds the bullet from (Sources.WeaponSource)
-            local Config = WeaponManager and WeaponManager:GetMuzzleConfig(WeaponName, MuzzleIndex or 1)
-            local Bullet = Config and type(Config.BulletSettings) == "table" and Config.BulletSettings[BulletIndex or 1]
-            local Speed = Bullet and tonumber(Bullet.MuzzleVelocity) or 0
-            local K = Bullet and tonumber(Bullet.Drag) or 1 -- the game's own default when Drag is missing
+            local Speed, K, Penetration = BulletOf(WeaponName, MuzzleIndex, BulletIndex)
 
             -- No ballistics for this weapon (some vehicle cannons live in another config): a straight-line guess
             -- would miss at range and look obvious, so leave the shot alone
@@ -370,17 +795,45 @@ do
                 return nil
             end
 
-            local Part, Character = PickTarget(Origin)
+            -- The plan: where the shot should go, and the seeds that suit that flight
+            local Wanted, Seeds
+            local Part, Character, Power, Draws = PickTarget(Origin, Penetration)
 
-            if not Part then
+            if Part then
+                local Root = Character:FindFirstChild("HumanoidRootPart")
+                local Velocity = Root and Root.AssemblyLinearVelocity or Vector3.zero
+                Wanted = Solve(Origin, Part.Position, Velocity, Speed, K, Workspace.Gravity)
+
+                if Wanted and Aim.SeedPick and Power and Power < 1 and (Draws or 0) > 0 then
+                    Seeds = PierceSeeds(#Directions, Draws)
+                end
+            else
+                -- Nobody to hit straight or through a wall: try glancing one off a wall onto them
+                local Point, _, Chance, _, Forced, Spread = FindBounce(Origin, Speed, K, Penetration)
+                Wanted = Point and Solve(Origin, Point, Vector3.zero, Speed, K, Workspace.Gravity)
+
+                if Wanted and Aim.SeedPick then
+                    Seeds = BounceSeeds(#Directions, Chance, Forced, Spread)
+                end
+            end
+
+            if not Wanted then
                 return nil
             end
 
-            local Root = Character:FindFirstChild("HumanoidRootPart")
-            local Velocity = Root and Root.AssemblyLinearVelocity or Vector3.zero
-            local Wanted = Solve(Origin, Part.Position, Velocity, Speed, K, Workspace.Gravity)
+            if Aim.Enabled then
+                return Retarget(Directions, Wanted), Seeds
+            end
 
-            return Wanted and Retarget(Directions, Wanted) or nil
+            -- Silent aim off: leave the bullets where you aimed them, and only hand over seeds if that's on the plan
+            local Sum = Vector3.zero
+
+            for _, Direction in next, Directions do
+                Sum += Direction.Unit
+            end
+
+            local OnPlan = Sum.Magnitude > 1e-6 and math.deg(math.acos(math.clamp(Sum.Unit:Dot(Wanted), -1, 1))) <= 1.5
+            return nil, OnPlan and Seeds or nil
         end
     end
 
@@ -415,12 +868,29 @@ do
             end
         }
     })
-    Targeting:Segmented({Title = "Hitbox", Values = {"Head", "Torso"}, Default = "Head", Flag = "Combat.SilentAim.Part", Callback = function(Value) Aim.Part = Value end})
+    Targeting:Dropdown({Title = "Hitbox", Values = {"Head", "Torso", "Closest limb", "Most wounded"}, Default = "Head", Flag = "Combat.SilentAim.Part", Tooltip = "Closest limb: nearest your crosshair. Most wounded: the limb with the least health left.", Callback = function(Value) Aim.Part = Value end})
     Targeting:Slider({Title = "Max distance", Min = 100, Max = 5000, Step = 50, Default = 2000, Suffix = " st", Flag = "Combat.SilentAim.Distance", Callback = function(Value) Aim.MaxDistance = Value end})
     Targeting:Toggle({Title = "Visible only", Tooltip = "Skip enemies behind walls.", Default = true, Flag = "Combat.SilentAim.Visible", Callback = function(Value) Aim.VisibleOnly = Value end})
     Targeting:Toggle({Title = "Ignore downed", Default = true, Flag = "Combat.SilentAim.SkipDowned", Callback = function(Value) Aim.SkipDowned = Value end})
     Targeting:Toggle({Title = "Bullet drop", Tooltip = "Aims high to cancel drop over distance.", Default = true, Flag = "Combat.SilentAim.Drop", Callback = function(Value) Aim.Drop = Value end})
     Targeting:Toggle({Title = "Prediction", Tooltip = "Leads moving targets.", Default = true, Flag = "Combat.SilentAim.Lead", Callback = function(Value) Aim.Lead = Value end})
+
+    -- Wallbangs and ricochets work with silent aim (bullets bent onto the plan) or aim lock (camera turned onto it)
+    local Shots = AimTab:Section({Title = "Ballistics", Icon = "zap", Side = "Left"})
+    Shots:Toggle({Title = "Wallbang", Tooltip = "With Visible only on, also targets enemies your bullet can punch through cover to reach.", Default = false, Flag = "Combat.SilentAim.Wallbang", Callback = function(Value) Aim.Wallbang = Value end})
+    Shots:Slider({Title = "Wallbang power", Min = 10, Max = 90, Step = 5, Default = 35, Suffix = "%", Flag = "Combat.SilentAim.MinPower", Tooltip = "Least bullet speed that has to make it through.", Callback = function(Value) Aim.MinPower = Value / 100 end})
+    Shots:Toggle({Title = "Ricochet shots", Tooltip = "No clear shot: bounce the bullet off a wall or the floor onto them.", Default = false, Flag = "Combat.SilentAim.Ricochet", Callback = function(Value) Aim.Ricochet = Value end})
+    Shots:Slider({Title = "Ricochet chance", Min = 30, Max = 95, Step = 5, Default = 60, Suffix = "%", Flag = "Combat.SilentAim.MinChance", Tooltip = "Least odds of the bounce happening. Metal and glass at a flat angle bounce best.", Callback = function(Value) Aim.MinChance = Value / 100 end})
+    Shots:Toggle({Title = "Seed picking", Tooltip = "Picks each bullet's random seed so ricochets land and wallbangs fly straight. Ricochets then work at much longer odds.", Default = false, Flag = "Combat.SilentAim.SeedPick", Callback = function(Value)
+        Aim.SeedPick = Value
+
+        if Value and ShotHook and not ShotHook.Seeds then
+            Notify("Seed picking", "The shot hook from an earlier run is still loaded. Rejoin once for seed picking to work.", "Warning", 6)
+        end
+    end})
+    Shots:Toggle({Title = "Show all ricochets", Tooltip = "Draws every bounce that can reach a hidden enemy on screen, with its odds. Works without any aim on.", Default = false, Flag = "Combat.SilentAim.ShowAll", Callback = function(Value) Aim.ShowAll = Value end})
+    Shots:Toggle({Title = "Bounce preview", Tooltip = "Draws the path of a lined-up ricochet.", Default = true, Flag = "Combat.SilentAim.Preview", Callback = function(Value) Aim.Preview = Value end})
+    Shots:Toggle({Title = "Shot indicator", Tooltip = "Shows under the crosshair when a wallbang or ricochet is lined up.", Default = true, Flag = "Combat.SilentAim.Indicator", Callback = function(Value) Aim.Indicator = Value end})
 
     local Silent = AimTab:Module({
         Title = "Silent aim",
@@ -472,18 +942,19 @@ do
         end
 
         local From = Camera.CFrame.Position
-        local Part, Character = PickTarget(From)
+        local Speed, K, Penetration = BulletOf(Tool.Name, 1, 1)
+        local Part, Character = PickTarget(From, Penetration)
+        local Wanted
 
-        if not Part then
-            return
+        if Part then
+            local Root = Character:FindFirstChild("HumanoidRootPart")
+            local Velocity = Root and Root.AssemblyLinearVelocity or Vector3.zero
+            Wanted = Speed > 0 and Solve(From, Part.Position, Velocity, Speed, K, Workspace.Gravity) or (Part.Position - From).Unit
+        else
+            -- No straight or through-the-wall shot: lock onto the ricochet point instead
+            local Point = FindBounce(From, Speed, K, Penetration)
+            Wanted = Point and Solve(From, Point, Vector3.zero, Speed, K, Workspace.Gravity)
         end
-
-        local Config = WeaponManager and WeaponManager:GetMuzzleConfig(Tool.Name, 1)
-        local Bullet = Config and type(Config.BulletSettings) == "table" and Config.BulletSettings[1]
-        local Speed = Bullet and tonumber(Bullet.MuzzleVelocity) or 0
-        local Root = Character:FindFirstChild("HumanoidRootPart")
-        local Velocity = Root and Root.AssemblyLinearVelocity or Vector3.zero
-        local Wanted = Speed > 0 and Solve(From, Part.Position, Velocity, Speed, Bullet and tonumber(Bullet.Drag) or 1, Workspace.Gravity) or (Part.Position - From).Unit
 
         if not Wanted then
             return
@@ -537,10 +1008,418 @@ do
         end
     end)
 
+    -- Shot indicator: what the next shot would do, checked a few times a second from the camera
+    local Indicator = Drawing and Drawing.new("Text")
+
+    if Indicator then
+        Indicator.Visible = false
+        Indicator.Center = true
+        Indicator.Outline = true
+        Indicator.Size = 16
+        Indicator.Font = 2
+    end
+
+    local IndicatorRunning = true
+
+    -- Bounce preview: crosshair to the wall, wall to the target, redrawn every frame from the last plan
+    local Plan -- {Point, Part}
+    local Legs = {}
+
+    for Index = 1, 2 do
+        Legs[Index] = Drawing and Drawing.new("Line")
+
+        if Legs[Index] then
+            Legs[Index].Visible = false
+            Legs[Index].Thickness = 2
+            Legs[Index].Color = Color3.fromRGB(90, 200, 255)
+            Legs[Index].Transparency = 0.9
+        end
+    end
+
+    local function DrawLeg(Leg, From, To, Camera)
+        local A, OnA = Camera:WorldToViewportPoint(From)
+        local B, OnB = Camera:WorldToViewportPoint(To)
+        local Show = A.Z > 0 and B.Z > 0 and (OnA or OnB)
+
+        Leg.Visible = Show
+
+        if Show then
+            Leg.From = Vector2.new(A.X, A.Y)
+            Leg.To = Vector2.new(B.X, B.Y)
+        end
+    end
+
+    local PreviewLoop = RunService.RenderStepped:Connect(function()
+        local Camera = Workspace.CurrentCamera
+        local Show = Plan and (Aim.Enabled or Lock.Enabled) and Aim.Preview and Plan[2].Parent ~= nil
+
+        for _, Leg in next, Legs do
+            Leg.Visible = false
+        end
+
+        if Show and Legs[1] then
+            DrawLeg(Legs[1], Camera.CFrame.Position + Camera.CFrame.LookVector * 4, Plan[1], Camera)
+            DrawLeg(Legs[2], Plan[1], Plan[2].Position, Camera)
+        end
+    end)
+
+    -- Ricochet map: every hidden enemy on screen that a bounce can reach, drawn at once, whether or not they're in
+    -- your FOV and whether or not any aim is on. Green is a likely bounce, yellow fair, orange a long shot.
+    local MAP_PATHS = 6
+    local MapDrawings = {}
+
+    for Index = 1, MAP_PATHS do
+        local Entry = {}
+
+        if Drawing then
+            Entry.Legs = {Drawing.new("Line"), Drawing.new("Line")}
+            Entry.Label = Drawing.new("Text")
+
+            for _, Leg in next, Entry.Legs do
+                Leg.Visible = false
+                Leg.Thickness = 1.5
+                Leg.Transparency = 0.85
+            end
+
+            Entry.Label.Visible = false
+            Entry.Label.Center = true
+            Entry.Label.Outline = true
+            Entry.Label.Size = 14
+            Entry.Label.Font = 2
+        end
+
+        MapDrawings[Index] = Entry
+    end
+
+    local function ChanceColor(Chance, Sure)
+        if Sure or Chance >= 0.75 then
+            return Color3.fromRGB(80, 220, 140)
+        end
+
+        return Chance >= 0.5 and Color3.fromRGB(255, 210, 60) or Color3.fromRGB(255, 140, 60)
+    end
+
+    local function ScanRicochets()
+        local Found = {}
+        local Camera, Tool = Workspace.CurrentCamera, HeldWeapon()
+
+        if not (Aim.ShowAll and Camera and Tool and Materials) then
+            Paths = Found
+            return
+        end
+
+        local From = Camera.CFrame.Position
+        local Speed, K, Penetration = BulletOf(Tool.Name, 1, 1)
+
+        if Speed <= 0 then
+            Paths = Found
+            return
+        end
+
+        RefreshVisibilityFilter()
+
+        -- Hidden enemies on screen, nearest first
+        local Hidden = {}
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = IsEnemy(Other) and Other.Character
+
+            if Character and Alive(Character) and not (Aim.SkipDowned and IsDowned(Character)) then
+                local Part = Candidates(Character)[1]
+                local Distance = Part and (Part.Position - From).Magnitude
+
+                if Distance and Distance <= Aim.MaxDistance then
+                    local _, OnScreen = Camera:WorldToViewportPoint(Part.Position)
+
+                    if OnScreen and not Visible(From, Part, Character) then
+                        table.insert(Hidden, {Part = Part, Character = Character, Distance = Distance})
+                    end
+                end
+            end
+        end
+
+        table.sort(Hidden, function(A, B) return A.Distance < B.Distance end)
+
+        for Index = 1, math.min(#Hidden, MAP_PATHS) do
+            local Entry = Hidden[Index]
+            local Point, Chance, Forced = BestBounceFor(From, Entry.Part, Entry.Character, Speed, K, Penetration)
+
+            if Point then
+                table.insert(Found, {Point, Entry.Part, Chance, Forced or Aim.SeedPick})
+            end
+        end
+
+        Paths = Found
+    end
+
+    local MapLoop = RunService.RenderStepped:Connect(function()
+        local Camera = Workspace.CurrentCamera
+
+        for Index, Entry in next, MapDrawings do
+            local Path = Aim.ShowAll and Paths[Index]
+
+            if Entry.Legs then
+                if Path and Path[2].Parent then
+                    local Color = ChanceColor(Path[3], Path[4])
+
+                    DrawLeg(Entry.Legs[1], Camera.CFrame.Position + Camera.CFrame.LookVector * 4, Path[1], Camera)
+                    DrawLeg(Entry.Legs[2], Path[1], Path[2].Position, Camera)
+                    Entry.Legs[1].Color, Entry.Legs[2].Color = Color, Color
+
+                    local Screen, OnScreen = Camera:WorldToViewportPoint(Path[1])
+                    Entry.Label.Visible = OnScreen
+                    Entry.Label.Position = Vector2.new(Screen.X, Screen.Y - 14)
+                    Entry.Label.Text = Path[4] and "sure" or ("%d%%"):format(math.floor(Path[3] * 100 + 0.5))
+                    Entry.Label.Color = Color
+                else
+                    Entry.Legs[1].Visible, Entry.Legs[2].Visible, Entry.Label.Visible = false, false, false
+                end
+            end
+        end
+    end)
+
+    task.spawn(function()
+        while IndicatorRunning do
+            pcall(ScanRicochets)
+            task.wait(0.25)
+        end
+    end)
+
+    task.spawn(function()
+        while IndicatorRunning and Indicator do
+            local Text, Color
+            Plan = nil
+
+            if (Aim.Enabled or Lock.Enabled) and (Aim.Indicator or Aim.Preview) and (Aim.Wallbang or Aim.Ricochet) then
+                local Camera, Tool = Workspace.CurrentCamera, HeldWeapon()
+
+                if Camera and Tool then
+                    pcall(function()
+                        local From = Camera.CFrame.Position
+                        local Speed, K, Penetration = BulletOf(Tool.Name, 1, 1)
+                        local Part, _, Power = PickTarget(From, Penetration)
+
+                        if Part and Power and Power < 1 then
+                            Text, Color = ("WALLBANG  %d%% power"):format(math.floor(Power * 100 + 0.5)), Color3.fromRGB(255, 170, 60)
+                        elseif not Part then
+                            local Point, _, Chance, Target, Forced = FindBounce(From, Speed, K, Penetration)
+
+                            if Point then
+                                -- With seed picking a won roll is chosen, so the odds no longer apply
+                                local Odds = (Aim.SeedPick or Forced) and "sure" or ("%d%%"):format(math.floor(Chance * 100 + 0.5))
+                                Text, Color = "RICOCHET  " .. Odds, Color3.fromRGB(90, 200, 255)
+                                Plan = Target and {Point, Target}
+                            end
+                        end
+                    end)
+                end
+            end
+
+            Text = Aim.Indicator and Text or nil
+            Indicator.Visible = Text ~= nil
+
+            if Text then
+                Indicator.Text = Text
+                Indicator.Color = Color
+                Indicator.Position = UserInputService:GetMouseLocation() + Vector2.new(0, 26)
+            end
+
+            task.wait(0.12)
+        end
+    end)
+
+    --// Triggerbot: fires for you. Crosshair mode shoots when the ray under your crosshair lands on an enemy (or, with
+    -- Wallbang on, on cover your round punches through to one). Silent aim mode shoots whenever silent aim has a
+    -- shot it would take: straight, through a wall, or off one. The click goes through the executor's mouse input,
+    -- so the game sees an ordinary left click.
+
+    local Trigger = {Enabled = false, Mode = "Crosshair", Delay = 0.05, Hold = false, Rate = 8}
+    local TriggerRunning = true
+    local Pressed = false
+
+    local VirtualInput = (function()
+        local Ok, Service = pcall(game.GetService, game, "VirtualInputManager")
+        return Ok and Service or nil
+    end)()
+
+    local function Press(Down)
+        if Pressed == Down then
+            return
+        end
+
+        Pressed = Down
+
+        if Down and mouse1press then
+            mouse1press()
+        elseif not Down and mouse1release then
+            mouse1release()
+        elseif VirtualInput then
+            local Mouse = UserInputService:GetMouseLocation()
+            VirtualInput:SendMouseButtonEvent(Mouse.X, Mouse.Y, 0, Down, game, 0)
+        end
+    end
+
+    local TriggerParams = RaycastParams.new()
+    TriggerParams.FilterType = Enum.RaycastFilterType.Exclude
+    TriggerParams.IgnoreWater = false
+
+    local function EnemyOf(Instance)
+        local Model = Instance and Instance:FindFirstAncestorOfClass("Model")
+        local Other = Model and Players:GetPlayerFromCharacter(Model)
+
+        if Other and IsEnemy(Other) and Alive(Model) and not (Aim.SkipDowned and IsDowned(Model)) then
+            return Model
+        end
+
+        return nil
+    end
+
+    local function OnTarget()
+        local Camera, Tool = Workspace.CurrentCamera, HeldWeapon()
+
+        if not (Camera and Tool) then
+            return false
+        end
+
+        local From = Camera.CFrame.Position
+        local Speed, K, Penetration = BulletOf(Tool.Name, 1, 1)
+
+        if Trigger.Mode == "Silent aim target" then
+            if not Aim.Enabled then
+                return false
+            end
+
+            return PickTarget(From, Penetration) ~= nil or FindBounce(From, Speed, K, Penetration) ~= nil
+        end
+
+        -- Crosshair: the first thing under your crosshair, or what's behind cover your round can punch through
+        RefreshVisibilityFilter()
+        TriggerParams.FilterDescendantsInstances = VisibilityParams.FilterDescendantsInstances
+
+        local Mouse = UserInputService:GetMouseLocation()
+        local Ray = Camera:ViewportPointToRay(Mouse.X, Mouse.Y)
+        local Reach = Ray.Direction * Aim.MaxDistance
+        local Result = Workspace:Raycast(Ray.Origin, Reach, TriggerParams)
+
+        if not Result then
+            return false
+        end
+
+        if EnemyOf(Result.Instance) then
+            return true
+        end
+
+        if Aim.Wallbang then
+            local Ignore = table.clone(TriggerParams.FilterDescendantsInstances)
+
+            -- What lies behind the cover along the same ray
+            for _ = 1, 4 do
+                table.insert(Ignore, Result.Instance)
+                TriggerParams.FilterDescendantsInstances = Ignore
+                Result = Workspace:Raycast(Ray.Origin, Reach, TriggerParams)
+
+                local Character = Result and EnemyOf(Result.Instance)
+
+                if Character then
+                    local Left = Penetrates(From, Result.Instance, Character, Penetration)
+                    return Left ~= nil and Left >= Aim.MinPower
+                elseif not Result then
+                    return false
+                end
+            end
+        end
+
+        return false
+    end
+
+    task.spawn(function()
+        local Since -- when the current target was first seen
+
+        while TriggerRunning do
+            local Ready = false
+
+            -- Never while you're clicking yourself, typing, or on the menu
+            if Trigger.Enabled and not UserInputService:GetFocusedTextBox() and not (UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) and not Pressed) then
+                local Ok, Hit = pcall(OnTarget)
+                Ready = Ok and Hit
+            end
+
+            if Ready then
+                Since = Since or os.clock()
+
+                if os.clock() - Since >= Trigger.Delay then
+                    if Trigger.Hold then
+                        Press(true)
+                    else
+                        -- Taps: press, a short hold so the game registers it, release, then wait out the rate
+                        Press(true)
+                        task.wait(0.03)
+                        Press(false)
+                        task.wait(math.max(1 / Trigger.Rate - 0.03, 0))
+                    end
+                end
+            else
+                Since = nil
+                Press(false)
+            end
+
+            task.wait(0.03)
+        end
+
+        Press(false)
+    end)
+
+    local TriggerCard = AimTab:Module({
+        Title = "Triggerbot",
+        Description = "Fires for you when a shot is there.",
+        Icon = "mouse-pointer-click",
+        Side = "Right",
+        Risky = true,
+        Default = false,
+        Flag = "Combat.Triggerbot",
+        Keybind = {Key = nil, Mode = "Toggle"},
+        Opened = true,
+        Callback = function(Enabled)
+            Trigger.Enabled = Enabled
+
+            if Enabled and not (mouse1press or VirtualInput) then
+                Notify("Triggerbot", "Your executor has no way to click the mouse, so the triggerbot can't fire.", "Error", 5)
+            end
+        end
+    })
+
+    TriggerCard:Dropdown({Title = "Fire when", Values = {"Crosshair", "Silent aim target"}, Default = "Crosshair", Flag = "Combat.Triggerbot.Mode", Tooltip = "Crosshair: an enemy under your crosshair. Silent aim target: any shot silent aim would take, ricochets included.", Callback = function(Value) Trigger.Mode = Value end})
+    TriggerCard:Slider({Title = "Delay", Min = 0, Max = 500, Step = 10, Default = 50, Suffix = " ms", Flag = "Combat.Triggerbot.Delay", Tooltip = "Wait this long on target before firing. A little looks human.", Callback = function(Value) Trigger.Delay = Value / 1000 end})
+    TriggerCard:Checkbox({Title = "Hold fire", Tooltip = "Hold the trigger while on target (automatics). Off taps instead (semi-autos, bolt actions).", Default = false, Flag = "Combat.Triggerbot.Hold", Callback = function(Value) Trigger.Hold = Value end})
+    TriggerCard:Slider({Title = "Tap rate", Min = 1, Max = 20, Step = 1, Default = 8, Suffix = " /s", Flag = "Combat.Triggerbot.Rate", Callback = function(Value) Trigger.Rate = Value end})
+
     OasisUI:OnUnload(function()
         Aim.Enabled = false
         Lock.Enabled = false
+        IndicatorRunning = false
+        TriggerRunning = false
+        Trigger.Enabled = false
+        PreviewLoop:Disconnect()
+        MapLoop:Disconnect()
+
+        for _, Entry in next, MapDrawings do
+            for _, Object in next, Entry.Legs or {} do
+                Object:Remove()
+            end
+
+            if Entry.Label then
+                Entry.Label:Remove()
+            end
+        end
         RunService:UnbindFromRenderStep("SuperNovaFrontAimLock")
+
+        if Indicator then
+            Indicator:Remove()
+        end
+
+        for _, Leg in next, Legs do
+            Leg:Remove()
+        end
 
         if ShotHook then
             ShotHook.Handler = nil
@@ -1117,6 +1996,215 @@ do
     OasisUI:OnUnload(Restore)
 end
 
+--// Amphibious: any vehicle you drive floats and swims.
+-- Shared.Vehicle.VehicleWaterClient floats a vehicle on the driver's client: every frame it hands the vehicle's
+-- RootPart to WaterFloat.step when the model's WaterOwner attribute is your UserId and WaterLine is set, using a
+-- part named WaterFloat as the buoyancy point. The server only sets those on amphibious vehicles (M113, MT-LB).
+-- Setting them on your own copy of the model, plus a float point, gets every other vehicle the same treatment.
+-- Thrust is added here, since the swim drive only exists on the amphibious ones.
+
+do
+    local Running = true
+    local Swim = {Enabled = false, Speed = 20, Turn = 0.6, Ride = 1, Highway = false, Boost = 3}
+    local WaterModule = Require(Shared and Shared:FindFirstChild("Water"))
+    local Active -- {Vehicle, Root, Float}
+
+    local SurfaceParams = RaycastParams.new()
+    SurfaceParams.FilterType = Enum.RaycastFilterType.Exclude
+    SurfaceParams.IgnoreWater = false
+
+    -- Only the driver's seat (DriverSeat) steers the boat
+    local function Driving()
+        local Seat = SeatOf(Player.Character)
+
+        if not (Seat and (Seat:IsA("VehicleSeat") or Seat.Name:lower():find("driver"))) then
+            return nil
+        end
+
+        local Vehicle = VehicleOfSeat(Seat)
+        local Root = Vehicle and Vehicle:FindFirstChild("RootPart")
+        return Root and Vehicle, Root, Seat
+    end
+
+    -- The water surface under the vehicle, if there is water there. The game's own finder (Water.surfaceY) covers
+    -- terrain water and the map's WaterVolumes; a plain raycast is the fallback.
+    local function Surface(Vehicle, Root)
+        if WaterModule and WaterModule.surfaceY then
+            local Ok, Y = pcall(WaterModule.surfaceY, Root.Position + Vector3.new(0, 20, 0))
+
+            if Ok and type(Y) == "number" and Y > Root.Position.Y - 15 then
+                return Y
+            end
+        end
+
+        SurfaceParams.FilterDescendantsInstances = {Vehicle, Player.Character or Vehicle}
+
+        local Result = Workspace:Raycast(Root.Position + Vector3.new(0, 40, 0), Vector3.new(0, -80, 0), SurfaceParams)
+
+        if Result and (Result.Material == Enum.Material.Water or WaterModule and WaterModule.isWater(Result.Instance, Result.Material)) then
+            return Result.Position.Y
+        end
+
+        return nil
+    end
+
+    local function Release()
+        if not Active then
+            return
+        end
+
+        local Vehicle = Active.Vehicle
+
+        if Vehicle.Parent and Vehicle:GetAttribute("WaterOwner") == Player.UserId and Active.Ours then
+            for _, Name in next, {"WaterOwner", "WaterLine", "WaterPhase", "SwimDrag", "SwimLateralDrag"} do
+                Vehicle:SetAttribute(Name, nil)
+            end
+        end
+
+        if Active.Float then
+            Active.Float:Destroy()
+        end
+
+        Active = nil
+    end
+
+    local function Take(Vehicle, Root)
+        -- Natively amphibious: the game already floats and drives it, so it's left alone
+        local Native = Vehicle:FindFirstChild("WaterFloat", true)
+
+        if Native then
+            return {Vehicle = Vehicle, Root = Root, Native = true}
+        end
+
+        -- Float point at the bottom of the hull, so it rides with the hull just under the waterline
+        local Box, Size = Vehicle:GetBoundingBox()
+        local Bottom = Box.Position - Vector3.new(0, Size.Y / 2, 0)
+
+        local Float = Instance.new("Part")
+        Float.Name = "WaterFloat"
+        Float.Size = Vector3.one
+        Float.Transparency = 1
+        Float.Massless = true
+        Float.CanCollide, Float.CanQuery, Float.CanTouch = false, false, false
+        Float.CFrame = CFrame.new(Bottom + Vector3.new(0, Swim.Ride, 0))
+
+        local Weld = Instance.new("WeldConstraint")
+        Weld.Part0 = Root
+        Weld.Part1 = Float
+        Weld.Parent = Float
+        Float.Parent = Vehicle
+
+        return {Vehicle = Vehicle, Root = Root, Float = Float, Ours = true}
+    end
+
+    local function Key(Code)
+        return UserInputService:IsKeyDown(Code) and 1 or 0
+    end
+
+    local function Step(Delta)
+        local Vehicle, Root, Seat = nil, nil, nil
+
+        if Swim.Enabled then
+            Vehicle, Root, Seat = Driving()
+        end
+
+        if Active and Active.Vehicle ~= Vehicle then
+            Release()
+        end
+
+        local Line = Vehicle and Surface(Vehicle, Root)
+
+        if not Line then
+            return Release()
+        end
+
+        Active = Active or Take(Vehicle, Root)
+
+        -- Natively amphibious vehicles keep the game's own swim unless the highway is on
+        if Active.Native and not Swim.Highway then
+            return
+        end
+
+        if not Active.Native then
+            Vehicle:SetAttribute("WaterOwner", Player.UserId)
+            Vehicle:SetAttribute("WaterLine", Line)
+            Vehicle:SetAttribute("WaterPhase", "Swimming")
+            -- The M113's swim drag; the highway drops the forward drag and keeps the sideways grip
+            Vehicle:SetAttribute("SwimDrag", Swim.Highway and 0.05 or 0.5)
+            Vehicle:SetAttribute("SwimLateralDrag", 3)
+        end
+
+        -- Thrust and turning from the seat, or the keys when the seat doesn't report them
+        local Typing = UserInputService:GetFocusedTextBox() ~= nil
+        local IsVehicleSeat = Seat:IsA("VehicleSeat")
+        local Throttle = IsVehicleSeat and Seat.ThrottleFloat ~= 0 and Seat.ThrottleFloat or (Typing and 0 or Key(Enum.KeyCode.W) - Key(Enum.KeyCode.S))
+        local Steer = IsVehicleSeat and Seat.SteerFloat ~= 0 and Seat.SteerFloat or (Typing and 0 or Key(Enum.KeyCode.D) - Key(Enum.KeyCode.A))
+
+        -- The driver sits facing forward; the seat part's own facing isn't guaranteed
+        local Body = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+        local Look = (Body or Seat).CFrame.LookVector
+        local Forward = Vector3.new(Look.X, 0, Look.Z)
+        Forward = Forward.Magnitude > 1e-3 and Forward.Unit or Vector3.zero
+
+        -- Highway: hold Shift for the boost
+        local Top = Swim.Speed
+
+        if Swim.Highway and not Typing and UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then
+            Top *= Swim.Boost
+        end
+
+        local Velocity = Root.AssemblyLinearVelocity
+        local Flat = Vector3.new(Velocity.X, 0, Velocity.Z)
+        local Wanted = Forward * Throttle * (Throttle >= 0 and Top or Top * 0.5)
+        local New = Flat:Lerp(Wanted, math.min(Delta * (Swim.Highway and 3 or 1.5), 1))
+        local Spin = Root.AssemblyAngularVelocity
+        local Turn = Spin.Y + (-Steer * Swim.Turn - Spin.Y) * math.min(Delta * 3, 1)
+
+        local function Write()
+            local Now = Root.AssemblyLinearVelocity
+            Root.AssemblyLinearVelocity = Vector3.new(New.X, Now.Y, New.Z)
+
+            local Current = Root.AssemblyAngularVelocity
+            Root.AssemblyAngularVelocity = Vector3.new(Current.X, Turn, Current.Z)
+        end
+
+        -- Written now and again after the game's own water step, which applies its drag in the same frame
+        Write()
+        task.defer(pcall, Write)
+    end
+
+    local Card = DriveTab:Module({
+        Title = "Amphibious",
+        Description = "Drive any vehicle into the water and it floats and swims.",
+        Icon = "waves",
+        Side = "Right",
+        Risky = true,
+        Default = false,
+        Flag = "Vehicle.Amphibious",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Swim.Enabled = Value end
+    })
+
+    Card:Slider({Title = "Water speed", Min = 5, Max = 200, Step = 1, Default = 20, Suffix = " st/s", Flag = "Vehicle.Amphibious.Speed", Callback = function(Value) Swim.Speed = Value end})
+    Card:Slider({Title = "Water turning", Min = 10, Max = 200, Step = 5, Default = 60, Suffix = "%", Flag = "Vehicle.Amphibious.Turn", Callback = function(Value) Swim.Turn = Value / 100 end})
+    Card:Checkbox({Title = "Water highway", Tooltip = "Hold Shift to boost. Near-zero water drag, and takes over the M113 and MT-LB too.", Default = false, Flag = "Vehicle.Amphibious.Highway", Callback = function(Value) Swim.Highway = Value end})
+    Card:Slider({Title = "Boost", Min = 1.5, Max = 8, Step = 0.5, Default = 3, Suffix = "x", Flag = "Vehicle.Amphibious.Boost", Callback = function(Value) Swim.Boost = Value end})
+    Card:Slider({Title = "Ride height", Min = 0, Max = 4, Step = 0.5, Default = 1, Suffix = " st", Flag = "Vehicle.Amphibious.Ride", Tooltip = "Higher sits the hull deeper. Applies next time you enter water.", Callback = function(Value) Swim.Ride = Value end})
+
+    local Connection = RunService.PreSimulation:Connect(function(Delta)
+        if Running then
+            pcall(Step, Delta)
+        end
+    end)
+
+    OasisUI:OnUnload(function()
+        Running = false
+        Connection:Disconnect()
+        pcall(Release)
+    end)
+end
+
 --// Medic: treat wounded teammates from range
 
 do
@@ -1687,6 +2775,304 @@ do
         end}
     })
 
+    --// Strike planner: the spot where one shell kills the most enemies. The artillery shell kills inside 15 studs
+    -- and hurts out to 70. The designation goes out like the button above (Binoculars "Designate" with an aim from
+    -- your head) and lands where that aim hits, so only spots you can see from where you stand are offered.
+
+    local Planner = {Enabled = false, Spare = true, Best = nil, Running = true}
+    local PLAN_KILL, PLAN_BLAST = 15, 70
+
+    local PlanParams = RaycastParams.new()
+    PlanParams.FilterType = Enum.RaycastFilterType.Exclude
+    PlanParams.IgnoreWater = true
+
+    local function Flat(A, B)
+        return Vector2.new(A.X - B.X, A.Z - B.Z).Magnitude
+    end
+
+    local function BestStrike()
+        local Head = HeadOf(MyCharacter())
+
+        if not Head then
+            return nil
+        end
+
+        local Foes, Friends, Ignore = {}, {}, {Workspace.CurrentCamera}
+        local IgnoreFolder = Workspace:FindFirstChild("Ignore")
+
+        if IgnoreFolder then
+            table.insert(Ignore, IgnoreFolder)
+        end
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = Other.Character
+            local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+            local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+
+            if Character then
+                table.insert(Ignore, Character)
+            end
+
+            if Root and Humanoid and Humanoid.Health > 0 then
+                if Enemy(Other) then
+                    table.insert(Foes, Root.Position)
+                elseif Other == Player or SameTeam(Other) then
+                    table.insert(Friends, Root.Position)
+                end
+            end
+        end
+
+        PlanParams.FilterDescendantsInstances = Ignore
+
+        -- Candidate centres: every enemy, and the middle of every group around each enemy
+        local Candidates = {}
+
+        for _, Foe in next, Foes do
+            table.insert(Candidates, Foe)
+
+            local Sum, Count = Vector3.zero, 0
+
+            for _, Other in next, Foes do
+                if Flat(Foe, Other) <= PLAN_KILL * 2 then
+                    Sum += Other
+                    Count += 1
+                end
+            end
+
+            if Count > 1 then
+                table.insert(Candidates, Sum / Count)
+            end
+        end
+
+        local Best
+
+        for _, Centre in next, Candidates do
+            if (Centre - Head.Position).Magnitude <= Spot.Range then
+                local Kills, Hurt, Close, Near = 0, 0, 0, 0
+
+                for _, Foe in next, Foes do
+                    local Gap = Flat(Foe, Centre)
+                    Kills += Gap <= PLAN_KILL and 1 or 0
+                    Hurt += Gap <= PLAN_BLAST and 1 or 0
+                end
+
+                for _, Friend in next, Friends do
+                    local Gap = Flat(Friend, Centre)
+                    Close += Gap <= PLAN_KILL and 1 or 0
+                    Near += Gap <= PLAN_BLAST and 1 or 0
+                end
+
+                local Score = Kills * 10 + Hurt - Near * 5
+
+                if Kills > 0 and not (Planner.Spare and Close > 0) and (not Best or Score > Best.Score) then
+                    -- The ground under the centre, and a clear line to it from your head
+                    local Down = Workspace:Raycast(Centre + Vector3.new(0, 10, 0), Vector3.new(0, -60, 0), PlanParams)
+                    local Point = Down and Down.Position
+
+                    if Point then
+                        local Aim = Point - Head.Position
+                        local Sight = Workspace:Raycast(Head.Position, Aim + Aim.Unit * 2, PlanParams)
+
+                        if Sight and (Sight.Position - Point).Magnitude <= 4 then
+                            Best = {Point = Point, Kills = Kills, Hurt = Hurt, Friends = Near, Score = Score}
+                        end
+                    end
+                end
+            end
+        end
+
+        return Best
+    end
+
+    local function Designate(Best)
+        local Head = HeadOf(MyCharacter())
+        return Best and Head and Send(Remote("Binoculars"), "Designate", (Best.Point - Head.Position).Unit)
+    end
+
+    -- Marker: a kill ring and a label at the best spot
+    local PlanRing = Instance.new("CylinderHandleAdornment")
+    PlanRing.Adornee = Workspace.Terrain
+    PlanRing.Height = 0.2
+    PlanRing.Radius = PLAN_KILL
+    PlanRing.InnerRadius = PLAN_KILL - 0.8
+    PlanRing.Color3 = Color3.fromRGB(255, 210, 60)
+    PlanRing.Transparency = 0.2
+    PlanRing.AlwaysOnTop = true
+    PlanRing.Visible = false
+    PlanRing.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    local PlanLabel = Drawing and Drawing.new("Text")
+
+    if PlanLabel then
+        PlanLabel.Visible = false
+        PlanLabel.Center = true
+        PlanLabel.Outline = true
+        PlanLabel.Size = 16
+        PlanLabel.Font = 2
+        PlanLabel.Color = Color3.fromRGB(255, 210, 60)
+    end
+
+    RadioSection:Toggle({Title = "Strike planner", Tooltip = "Marks the visible spot where a shell kills the most enemies.", Default = false, Flag = "Support.Planner", Callback = function(Value) Planner.Enabled = Value end})
+    RadioSection:Checkbox({Title = "Spare teammates", Tooltip = "Never picks a spot with a teammate (or you) inside the kill ring.", Default = true, Flag = "Support.Planner.Spare", Callback = function(Value) Planner.Spare = Value end})
+
+    RadioSection:Buttons({
+        {Title = "Designate best spot", Icon = "target", Callback = function()
+            local Best = BestStrike()
+
+            if not Best then
+                return Notify("Strike planner", "No enemy group you can see from here.", "Warning")
+            end
+
+            Notify("Strike planner", Designate(Best) and ("Designated. %d in the kill ring, %d in blast range."):format(Best.Kills, Best.Hurt) or "No Binoculars remote.", "Info")
+        end},
+        {Title = "Designate + call", Icon = "radio", Style = "Primary", Callback = function() task.spawn(function()
+            local Name = SupportPick:Get()
+            local Best = BestStrike()
+
+            if not Name then
+                return Notify("Strike planner", "Pick a support first.", "Warning")
+            elseif not (Best and Designate(Best)) then
+                return Notify("Strike planner", "No enemy group you can see from here.", "Warning")
+            end
+
+            -- A moment for the designation to land before the call reads it
+            task.wait(0.3)
+            Send(Remote("Radio"), "Callout", Name)
+            Notify("Strike planner", ("Called %s on %d enemies."):format(Name, Best.Kills), "Info")
+        end) end}
+    })
+
+    task.spawn(function()
+        while Planner.Running do
+            local Ok, Best = pcall(function()
+                return Planner.Enabled and BestStrike() or nil
+            end)
+
+            Planner.Best = Ok and Best or nil
+            PlanRing.Visible = Planner.Best ~= nil
+
+            if Planner.Best then
+                PlanRing.CFrame = CFrame.new(Planner.Best.Point) * CFrame.Angles(math.rad(90), 0, 0)
+            end
+
+            task.wait(0.3)
+        end
+    end)
+
+    local PlanLoop = RunService.RenderStepped:Connect(function()
+        if not PlanLabel then
+            return
+        end
+
+        local Best = Planner.Best
+        local Screen, OnScreen
+
+        if Best then
+            Screen, OnScreen = Workspace.CurrentCamera:WorldToViewportPoint(Best.Point + Vector3.new(0, 4, 0))
+        end
+
+        PlanLabel.Visible = OnScreen == true
+
+        if OnScreen then
+            PlanLabel.Position = Vector2.new(Screen.X, Screen.Y)
+            PlanLabel.Text = ("STRIKE HERE  %d kill%s  %d hurt%s"):format(Best.Kills, Best.Kills == 1 and "" or "s", Best.Hurt, Best.Friends > 0 and ("  %d friendly near"):format(Best.Friends) or "")
+        end
+    end)
+
+    OasisUI:OnUnload(function()
+        Planner.Running = false
+        PlanLoop:Disconnect()
+        PlanRing:Destroy()
+
+        if PlanLabel then
+            PlanLabel:Remove()
+        end
+    end)
+
+    --// Squad markers: the squad ping (Remotes.Squad "PlaceMarker", position, part) put on enemies for you. Pinned
+    -- to a part of their body, so it marks them for your whole squad through the game's own HUD. Needs a squad;
+    -- the game allows one ping every 2 seconds.
+
+    local Marker = {Auto = false, Mode = "Nearest to you", Every = 4, VisibleOnly = true, Range = 1500, Last = 0, Running = true}
+
+    local function MarkTarget()
+        local Head = HeadOf(MyCharacter())
+        local Camera = Workspace.CurrentCamera
+        local Mouse = UserInputService:GetMouseLocation()
+        local Best, BestScore
+
+        if not Head then
+            return nil
+        end
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = Enemy(Other) and Other.Character
+            local Target = HeadOf(Character)
+            local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+
+            if Target and Humanoid and Humanoid.Health > 0 and not IsDowned(Character) then
+                local Distance = (Target.Position - Head.Position).Magnitude
+
+                if Distance <= Marker.Range and (not Marker.VisibleOnly or ClearLine(Head.Position, Character)) then
+                    local Score
+
+                    if Marker.Mode == "Nearest to you" then
+                        Score = Distance
+                    else
+                        local Screen, OnScreen = Camera:WorldToViewportPoint(Target.Position)
+                        Score = OnScreen and (Vector2.new(Screen.X, Screen.Y) - Mouse).Magnitude or nil
+                    end
+
+                    if Score and (not BestScore or Score < BestScore) then
+                        Best, BestScore = Target, Score
+                    end
+                end
+            end
+        end
+
+        return Best
+    end
+
+    local function PlaceMarker(Quiet)
+        if os.clock() - Marker.Last < 2 then
+            return Quiet or Notify("Squad markers", "The game allows one ping every 2 seconds.", "Warning", 2)
+        end
+
+        local Target = MarkTarget()
+
+        if not Target then
+            return Quiet or Notify("Squad markers", "No enemy to mark.", "Warning", 2)
+        end
+
+        Marker.Last = os.clock()
+
+        if not Send(Remote("Squad"), "PlaceMarker", Target.Position, Target) and not Quiet then
+            Notify("Squad markers", "No Squad remote.", "Error", 3)
+        end
+    end
+
+    local MarkerSection = SupportTab:Section({Title = "Squad markers", Icon = "map-pin", Side = "Left"})
+    MarkerSection:Dropdown({Title = "Target", Values = {"Nearest to you", "Crosshair"}, Default = "Nearest to you", Flag = "Support.Markers.Mode", Callback = function(Value) Marker.Mode = Value end})
+    MarkerSection:Button({Title = "Mark enemy", Icon = "map-pin", Style = "Primary", Callback = function() PlaceMarker(false) end})
+    MarkerSection:Toggle({Title = "Auto-mark", Tooltip = "Keeps a ping on the target for your squad. You need to be in a squad.", Default = false, Flag = "Support.Markers.Auto", Callback = function(Value) Marker.Auto = Value end})
+    MarkerSection:Slider({Title = "Every", Min = 2, Max = 20, Step = 1, Default = 4, Suffix = " s", Flag = "Support.Markers.Every", Callback = function(Value) Marker.Every = Value end})
+    MarkerSection:Toggle({Title = "Visible only", Tooltip = "Only mark enemies you can see, so the pings look like your own.", Default = true, Flag = "Support.Markers.Visible", Callback = function(Value) Marker.VisibleOnly = Value end})
+    MarkerSection:Slider({Title = "Range", Min = 100, Max = 5000, Step = 100, Default = 1500, Suffix = " st", Flag = "Support.Markers.Range", Callback = function(Value) Marker.Range = Value end})
+
+    task.spawn(function()
+        while Marker.Running do
+            if Marker.Auto and os.clock() - Marker.Last >= Marker.Every then
+                pcall(PlaceMarker, true)
+            end
+
+            task.wait(0.5)
+        end
+    end)
+
+    OasisUI:OnUnload(function()
+        Marker.Running = false
+    end)
+
     local ReviveSection = SupportTab:Section({Title = "Revive", Icon = "heart-pulse", Side = "Left"})
     ReviveSection:Button({Title = "Revive nearest", Icon = "heart-pulse", Style = "Primary", Callback = function()
         task.spawn(ReviveNearest, false)
@@ -1745,62 +3131,98 @@ do
 
     --// Cards: Misc > Match
 
-    local Vote = {Auto = false, Map = "", Spam = false, GameIndex = 0}
-    local Voted = {} -- vote kind -> what we last voted this round
+    -- The server opens a vote with Match "StartMapVoting" (MapsInfo: map name -> info) or "StartGameVoting" (Options:
+    -- cards of {Index, MapName, Mode, Weather, TimeOfDay}), and takes a vote as Match("MapVote", map name) or
+    -- Match("GameVote", card index). Listening to those messages works whether or not the vote screen is drawn.
+    local Vote = {Auto = false, Map = "", Mode = "", Spam = false}
+    local Ballot -- the open vote: {Kind, Choice, Sent}
+    local SeenMaps, SeenModes = {}, {}
 
-    local function VoteFrames()
-        local Gui = Player:FindFirstChildOfClass("PlayerGui")
-        local Match = Gui and Gui:FindFirstChild("MatchGui")
-        return Match and Match:FindFirstChild("MapVoteFrame"), Match and Match:FindFirstChild("GameVoteFrame"), Match
+    local function Matches(Value, Wanted)
+        return Wanted ~= "" and type(Value) == "string" and Value:lower():find(Wanted:lower(), 1, true) ~= nil
     end
 
-    local function Showing(Frame, Root)
-        return Frame ~= nil and Frame.Visible and (not Root:IsA("ScreenGui") or Root.Enabled)
+    -- The card for your map and mode: both is best, then the map, then the mode
+    local function Choose(Kind, Data)
+        if Kind == "Map" then
+            for Name in next, type(Data.MapsInfo) == "table" and Data.MapsInfo or {} do
+                if Matches(Name, Vote.Map) then
+                    return Name
+                end
+            end
+
+            return nil
+        end
+
+        local Best, BestScore = nil, 0
+
+        for _, Card in next, type(Data.Options) == "table" and Data.Options or {} do
+            local Score = (Matches(Card.MapName, Vote.Map) and 2 or 0) + (Matches(Card.Mode, Vote.Mode) and 1 or 0)
+
+            if Score > BestScore then
+                Best, BestScore = Card.Index, Score
+            end
+        end
+
+        return Best
     end
 
-    local function UpdateVotes()
-        local MapFrame, GameFrame, Root = VoteFrames()
-        local Match = Remote("Match")
-
-        if not (Match and Root) then
+    local function CastVote()
+        if not (Vote.Auto and Ballot and Ballot.Choice ~= nil) or Ballot.Sent and not Vote.Spam then
             return
         end
 
-        local Options = MapFrame and MapFrame:FindFirstChild("VotingOptions")
-
-        if Vote.Auto and Vote.Map ~= "" and Showing(MapFrame, Root) and Options then
-            for _, Option in next, Options:GetChildren() do
-                if Option:IsA("GuiButton") and Option.Visible and Option.Name:lower():find(Vote.Map:lower(), 1, true) then
-                    if Vote.Spam or Voted.Map ~= Option.Name then
-                        Send(Match, "MapVote", Option.Name)
-                        Voted.Map = Option.Name
-                    end
-
-                    break
-                end
-            end
-        elseif not Showing(MapFrame, Root) then
-            Voted.Map = nil
-        end
-
-        if Vote.Auto and Vote.GameIndex > 0 and Showing(GameFrame, Root) then
-            if Vote.Spam or Voted.Game ~= Vote.GameIndex then
-                Send(Match, "GameVote", Vote.GameIndex)
-                Voted.Game = Vote.GameIndex
-            end
-        elseif not Showing(GameFrame, Root) then
-            Voted.Game = nil
-        end
+        Ballot.Sent = Send(Remote("Match"), Ballot.Kind == "Map" and "MapVote" or "GameVote", Ballot.Choice)
     end
 
+    local MatchRemote = Remote("Match")
+    local VoteConnection = MatchRemote and MatchRemote.OnClientEvent:Connect(function(Name, Data)
+        if Name == "StartMapVoting" or Name == "StartGameVoting" then
+            local Kind = Name == "StartMapVoting" and "Map" or "Game"
+            Data = type(Data) == "table" and Data or {}
+
+            for Map in next, type(Data.MapsInfo) == "table" and Data.MapsInfo or {} do
+                SeenMaps[Map] = true
+            end
+
+            for _, Card in next, type(Data.Options) == "table" and Data.Options or {} do
+                SeenMaps[tostring(Card.MapName)] = true
+                SeenModes[tostring(Card.Mode)] = true
+            end
+
+            Ballot = {Kind = Kind, Data = Data, Choice = Choose(Kind, Data)}
+
+            -- A beat after the screen opens, like a person clicking
+            task.delay(0.6, CastVote)
+        elseif Name == "EndVoting" or Name == "EndGameVoting" then
+            Ballot = nil
+        end
+    end)
+
+    -- Called every second by the support loop: catches a vote that opened before Auto-vote was on, and resends
+    local function UpdateVotes()
+        if Ballot and Ballot.Choice == nil then
+            Ballot.Choice = Choose(Ballot.Kind, Ballot.Data)
+        end
+
+        CastVote()
+    end
+
+    OasisUI:OnUnload(function()
+        if VoteConnection then
+            VoteConnection:Disconnect()
+        end
+    end)
+
     local Votes = MatchTab:Section({Title = "Votes", Icon = "vote", Side = "Left"})
-    Votes:Toggle({Title = "Auto-vote", Tooltip = "Votes for your map (and game mode) the moment voting opens.", Default = false, Flag = "Match.AutoVote", Callback = function(Value) Vote.Auto = Value end})
-    -- Map names come from the admin command list (its map argument) plus whatever is on the vote screen now
+    Votes:Toggle({Title = "Auto-vote", Tooltip = "Votes for your map and mode the moment voting opens.", Default = false, Flag = "Match.AutoVote", Callback = function(Value) Vote.Auto = Value end})
+
+    -- Map names come from the admin command list (its map argument) plus every vote seen this session
     local function MapNames()
         local Names, Seen = {}, {}
 
         local function Add(Name)
-            if type(Name) == "string" and Name ~= "" and not Seen[Name] then
+            if type(Name) == "string" and Name ~= "" and Name ~= "nil" and not Seen[Name] then
                 Seen[Name] = true
                 table.insert(Names, Name)
             end
@@ -1813,12 +3235,20 @@ do
             Add(type(Key) == "string" and Key or Value)
         end
 
-        local MapFrame = VoteFrames()
-        local Options = MapFrame and MapFrame:FindFirstChild("VotingOptions")
+        for Name in next, SeenMaps do
+            Add(Name)
+        end
 
-        for _, Option in next, Options and Options:GetChildren() or {} do
-            if Option:IsA("GuiButton") then
-                Add(Option.Name)
+        table.sort(Names)
+        return Names
+    end
+
+    local function ModeNames()
+        local Names = {}
+
+        for Name in next, SeenModes do
+            if Name ~= "nil" then
+                table.insert(Names, Name)
             end
         end
 
@@ -1826,7 +3256,7 @@ do
         return Names
     end
 
-    local MapPick
+    local MapPick, ModePick
     MapPick = Votes:Dropdown({
         Title = "Map",
         Values = MapNames(),
@@ -1836,8 +3266,16 @@ do
         Action = {Icon = "refresh-cw", Tooltip = "Refresh", Callback = function() MapPick:Refresh(MapNames(), true) end},
         Callback = function(Value) Vote.Map = type(Value) == "string" and Value or "" end
     })
-    Votes:Slider({Title = "Game mode card", Min = 0, Max = 4, Step = 1, Default = 0, Flag = "Match.AutoVote.Game", Tooltip = "Counting from the left. 0 is off.", Callback = function(Value) Vote.GameIndex = Value end})
-    Votes:Checkbox({Title = "Vote repeatedly", Tooltip = "Resends your vote every second.", Default = false, Flag = "Match.AutoVote.Spam", Callback = function(Value) Vote.Spam = Value end})
+    ModePick = Votes:Dropdown({
+        Title = "Mode",
+        Values = ModeNames(),
+        AllowNone = true,
+        Flag = "Match.AutoVote.Mode",
+        Tooltip = "Fills in after the first game vote you see. Refresh then.",
+        Action = {Icon = "refresh-cw", Tooltip = "Refresh", Callback = function() ModePick:Refresh(ModeNames(), true) end},
+        Callback = function(Value) Vote.Mode = type(Value) == "string" and Value or "" end
+    })
+    Votes:Checkbox({Title = "Vote repeatedly", Tooltip = "Resends your vote every second while voting is open.", Default = false, Flag = "Match.AutoVote.Spam", Callback = function(Value) Vote.Spam = Value end})
 
     --// Cards: Misc > Staff
 
@@ -3127,11 +4565,10 @@ do
             -- Who's sitting in what, worked out once per pass instead of once per vehicle
             local Crew = {}
 
-            for _, Other in next, Players:GetPlayers() do
-                local Humanoid = Other.Character and Other.Character:FindFirstChildOfClass("Humanoid")
-                local Seat = Humanoid and Humanoid.SeatPart
+            for _, Seat in next, CollectionService:GetTagged("FactoryVehicleSeat") do
+                local Occupant = Seat:FindFirstChild("Occupant")
 
-                if Seat then
+                if Occupant and Occupant:IsA("ObjectValue") and Occupant.Value ~= nil then
                     table.insert(Crew, Seat)
                 end
             end
@@ -3229,6 +4666,1797 @@ do
         Running = false
         ClearRadar()
         TagFolder:Destroy()
+    end)
+end
+
+--// Alerts: incoming strikes, live grenades, enemies aiming at you, gunfire, objective pressure.
+-- All of it reads what the server already replicates to every client; nothing here is sent anywhere.
+
+do
+    local CollectionService = game:GetService("CollectionService")
+    local Running = true
+
+    local Alert = {
+        Strikes = false, FriendlyStrikes = true,
+        Grenades = false, GrenadeRange = 60,
+        Aimed = false, AimedCone = 4, AimedRange = 800, Arrows = true,
+        Gunfire = false, GunfireFriendly = false, GunfireTime = 5, NearMiss = true, GunfireMap = true,
+        Objectives = false, ObjectiveLabels = true, CaptureClock = true,
+        Magazines = false, MagazineRange = 400, TurretAmmo = true,
+        BlindSpots = false, BlindRadius = 60, BlindCone = 60, BlindSafe = true
+    }
+
+    local RED, ORANGE, BLUE, WHITE = Color3.fromRGB(255, 70, 70), Color3.fromRGB(255, 170, 60), Color3.fromRGB(90, 150, 255), Color3.fromRGB(235, 235, 235)
+    local STUDS_PER_METER = 3.57
+
+    -- The artillery shell's explosionSettings: certain death inside KillRange, damage out to Range
+    local STRIKE_KILL, STRIKE_RANGE = 15, 70
+
+    -- Grenade fallbacks by GrenadeType, from GrenadeConfigManager (M67, RGD-5, F-1 / RGO, M33A1)
+    local GRENADE_DEFAULTS = {Frag = {Fuze = 4, Kill = 10, Range = 40}, Impact = {Fuze = 1, Kill = 10, Range = 40}}
+
+    local Ballistics = Shared and Shared:FindFirstChild("Ballistics")
+    local ShotCodec = Require(Ballistics and Ballistics:FindFirstChild("ShotCodec"))
+    local MatchObjectives = Require(Shared and Shared:FindFirstChild("MatchObjectives"))
+    local TriggerVolume = Require(Shared and Shared:FindFirstChild("TriggerVolume"))
+    local GrenadeConfigs = Shared and Shared:FindFirstChild("GrenadeConfigManager")
+
+    local Folder = Instance.new("Folder")
+    Folder.Name = "SuperNovaAlerts"
+    Folder.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    local function IsEnemy(Other)
+        return Other ~= Player and Other.Team ~= nil and Player.Team ~= nil and Other.Team ~= Player.Team
+    end
+
+    local function RootOf(Character)
+        return Character and (Character.PrimaryPart or Character:FindFirstChild("HumanoidRootPart"))
+    end
+
+    local function Alive(Character)
+        local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+        return Humanoid ~= nil and Humanoid.Health > 0
+    end
+
+    local function Meters(Studs)
+        return math.floor(Studs / STUDS_PER_METER + 0.5)
+    end
+
+    -- Keyed pools: one object per key, and everything whose key wasn't seen this pass is destroyed
+    local function Pool(Make)
+        local Items = {}
+
+        return {
+            Get = function(Key)
+                Items[Key] = Items[Key] or Make()
+                return Items[Key]
+            end,
+            Sweep = function(Seen)
+                for Key, Item in next, Items do
+                    if not Seen[Key] then
+                        Item.Destroy()
+                        Items[Key] = nil
+                    end
+                end
+            end
+        }
+    end
+
+    local function NewTag()
+        local Gui = Instance.new("BillboardGui")
+        Gui.Size = UDim2.fromOffset(220, 34)
+        Gui.StudsOffset = Vector3.new(0, 3, 0)
+        Gui.AlwaysOnTop = true
+        Gui.LightInfluence = 0
+
+        local Label = Instance.new("TextLabel")
+        Label.Size = UDim2.fromScale(1, 1)
+        Label.BackgroundTransparency = 1
+        Label.Font = Enum.Font.GothamBold
+        Label.TextSize = 13
+        Label.TextStrokeTransparency = 0.35
+        Label.Parent = Gui
+
+        Gui.Parent = Folder
+        return {Gui = Gui, Label = Label, Destroy = function() Gui:Destroy() end}
+    end
+
+    -- A flat ring on the ground, drawn through walls. Adorned to Terrain, whose CFrame is the world origin.
+    local function NewRing(Color, Transparency)
+        local Ring = Instance.new("CylinderHandleAdornment")
+        Ring.Adornee = Workspace.Terrain
+        Ring.Height = 0.2
+        Ring.Color3 = Color
+        Ring.Transparency = Transparency
+        Ring.AlwaysOnTop = true
+        Ring.ZIndex = 1
+        Ring.Parent = Folder
+        return Ring
+    end
+
+    local function PlaceRing(Ring, Position, Radius, Width)
+        Ring.Radius = Radius
+        Ring.InnerRadius = math.max(Radius - Width, 0)
+        Ring.CFrame = CFrame.new(Position) * CFrame.Angles(math.rad(90), 0, 0)
+    end
+
+    -- A danger zone: kill ring, blast ring and a label at the centre (also hung off Terrain, by world offset)
+    local function NewZone()
+        local Zone = NewTag()
+        Zone.Gui.Adornee = Workspace.Terrain
+        Zone.Gui.StudsOffset = Vector3.zero
+        Zone.Kill = NewRing(RED, 0.25)
+        Zone.Blast = NewRing(ORANGE, 0.55)
+
+        Zone.Destroy = function()
+            Zone.Gui:Destroy()
+            Zone.Kill:Destroy()
+            Zone.Blast:Destroy()
+        end
+
+        return Zone
+    end
+
+    local function PlaceZone(Zone, Position, Kill, Range, Text, Color)
+        PlaceRing(Zone.Kill, Position, Kill, 0.8)
+        PlaceRing(Zone.Blast, Position, Range, 0.5)
+        Zone.Gui.StudsOffsetWorldSpace = Position + Vector3.new(0, 3, 0)
+        Zone.Label.Text = Text
+        Zone.Label.TextColor3 = Color
+    end
+
+    --// On-screen warnings: stacked lines at the top, and arrows around the crosshair pointing at the threat
+
+    local Lines, Arrows = {}, {}
+    local Warnings, Pointers = {}, {}
+
+    local function DrawingOf(List, Index, Kind)
+        if not Drawing then
+            return nil
+        end
+
+        local Object = List[Index]
+
+        if not Object then
+            Object = Drawing.new(Kind)
+
+            if Kind == "Text" then
+                Object.Center = true
+                Object.Outline = true
+                Object.Size = 20
+                Object.Font = 2
+            else
+                Object.Filled = true
+                Object.Thickness = 1
+                Object.Transparency = 0.85
+            end
+
+            List[Index] = Object
+        end
+
+        return Object
+    end
+
+    local function HideFrom(List, First)
+        for Index = First, #List do
+            List[Index].Visible = false
+        end
+    end
+
+    local function DrawWarnings()
+        local Camera = Workspace.CurrentCamera
+
+        for Index, Warning in next, Warnings do
+            local Line = DrawingOf(Lines, Index, "Text")
+
+            if Line then
+                Line.Text = Warning[1]
+                Line.Color = Warning[2]
+                Line.Position = Vector2.new(Camera.ViewportSize.X / 2, 96 + (Index - 1) * 24)
+                Line.Visible = true
+            end
+        end
+
+        HideFrom(Lines, #Warnings + 1)
+    end
+
+    -- Every frame, so the arrows turn with the camera
+    local function DrawArrows()
+        local Camera = Workspace.CurrentCamera
+        local Count = 0
+
+        if Alert.Arrows then
+            local Centre = Camera.ViewportSize / 2
+
+            for _, Pointer in next, Pointers do
+                local Relative = Camera.CFrame:PointToObjectSpace(Pointer[1])
+                local Flat = Vector2.new(Relative.X, Relative.Z)
+
+                if Flat.Magnitude > 1e-3 then
+                    Count += 1
+
+                    local Direction = Flat.Unit
+                    local Side = Vector2.new(-Direction.Y, Direction.X)
+                    local Base = Centre + Direction * 120
+                    local Arrow = DrawingOf(Arrows, Count, "Triangle")
+
+                    if Arrow then
+                        Arrow.PointA = Base + Direction * 16
+                        Arrow.PointB = Base + Side * 9
+                        Arrow.PointC = Base - Side * 9
+                        Arrow.Color = Pointer[2]
+                        Arrow.Visible = true
+                    end
+                end
+            end
+        end
+
+        HideFrom(Arrows, Count + 1)
+    end
+
+    --// Incoming strikes: a radioman's designated target is a Vector3Value in their CharacterValues, and it
+    -- replicates to everyone. Vector3.zero means no target.
+
+    local Zones = Pool(NewZone)
+
+    local function UpdateStrikes(MyPosition)
+        local Seen = {}
+
+        if not Alert.Strikes then
+            return Zones.Sweep(Seen)
+        end
+
+        for _, Other in next, Players:GetPlayers() do
+            local Values = Other.Character and Other.Character:FindFirstChild("CharacterValues")
+            local Designated = Values and Values:FindFirstChild("DesignatedPosition")
+            local Enemy = IsEnemy(Other)
+
+            if Designated and Designated:IsA("Vector3Value") and Designated.Value ~= Vector3.zero and (Enemy or Alert.FriendlyStrikes) then
+                local Target = Designated.Value
+                local Key = "Strike" .. Other.UserId
+                local Gap = MyPosition and (Vector3.new(MyPosition.X, Target.Y, MyPosition.Z) - Target).Magnitude
+                Seen[Key] = true
+
+                PlaceZone(Zones.Get(Key), Target, STRIKE_KILL, STRIKE_RANGE, (Enemy and "ENEMY STRIKE" or "FRIENDLY STRIKE") .. (Gap and ("  " .. Meters(Gap) .. " m") or ""), Enemy and RED or BLUE)
+
+                if Gap and Gap <= STRIKE_KILL then
+                    table.insert(Warnings, {"ARTILLERY: inside the kill zone, move", RED})
+                    table.insert(Pointers, {Target, RED})
+                elseif Gap and Gap <= STRIKE_RANGE then
+                    table.insert(Warnings, {("ARTILLERY: inside blast range (%d m from centre)"):format(Meters(Gap)), ORANGE})
+                end
+            end
+        end
+
+        Zones.Sweep(Seen)
+    end
+
+    --// Grenades: thrown grenades are parts in workspace.Ignore.Dropped carrying a GrenadeType attribute
+
+    local FirstSeen = setmetatable({}, {__mode = "k"})
+    local ConfigCache = {}
+    local GrenadeZones = Pool(NewZone)
+
+    local function GrenadeConfig(Part)
+        local Name = Part.Name
+
+        if ConfigCache[Name] == nil then
+            local Config = Require(GrenadeConfigs and GrenadeConfigs:FindFirstChild(Name))
+            local Blast = type(Config) == "table" and type(Config.explosionSettings) == "table" and Config.explosionSettings
+            local Fallback = GRENADE_DEFAULTS[Part:GetAttribute("GrenadeType")] or GRENADE_DEFAULTS.Frag
+
+            ConfigCache[Name] = {
+                Fuze = type(Config) == "table" and tonumber(Config.Fuze) or Fallback.Fuze,
+                Kill = Blast and tonumber(Blast.KillRange) or Fallback.Kill,
+                Range = Blast and tonumber(Blast.Range) or Fallback.Range
+            }
+        end
+
+        return ConfigCache[Name]
+    end
+
+    local function UpdateGrenades(MyPosition)
+        local Seen = {}
+        local Ignore = Workspace:FindFirstChild("Ignore")
+        local Dropped = Alert.Grenades and Ignore and Ignore:FindFirstChild("Dropped")
+
+        for _, Part in next, Dropped and Dropped:GetChildren() or {} do
+            local Kind = Part:IsA("BasePart") and Part:GetAttribute("GrenadeType")
+
+            if Kind and Kind ~= "Smoke" then
+                local Gap = MyPosition and (Part.Position - MyPosition).Magnitude
+                FirstSeen[Part] = FirstSeen[Part] or os.clock()
+
+                if Gap and Gap <= Alert.GrenadeRange then
+                    local Config = GrenadeConfig(Part)
+
+                    -- Counted from when it appeared; a cooked grenade goes off sooner
+                    local Left = math.max(Config.Fuze - (os.clock() - FirstSeen[Part]), 0)
+                    local Timer = Kind == "Impact" and "impact" or ("%.1f s"):format(Left)
+                    local Color = Gap <= Config.Kill and RED or ORANGE
+                    Seen[Part] = true
+
+                    PlaceZone(GrenadeZones.Get(Part), Part.Position - Vector3.new(0, Part.Size.Y / 2, 0), Config.Kill, Config.Range, ("%s  %s  %d m"):format(string.upper(Kind), Timer, Meters(Gap)), Color)
+
+                    if Gap <= Config.Range then
+                        table.insert(Warnings, {("GRENADE %s: %s"):format(Timer, Gap <= Config.Kill and "inside the kill radius, move" or "inside blast range"), Color})
+                        table.insert(Pointers, {Part.Position, Color})
+                    end
+                end
+            end
+        end
+
+        GrenadeZones.Sweep(Seen)
+    end
+
+    --// Being aimed at: another player's head is posed from their camera pitch and yaw (BodyRotation), so the
+    -- head's facing is where they look. A narrow cone onto your head, a gun in hand and a clear line means a threat.
+
+    local SightParams = RaycastParams.new()
+    SightParams.FilterType = Enum.RaycastFilterType.Exclude
+    SightParams.IgnoreWater = true
+
+    local function UpdateAimed()
+        local Mine = Player.Character and Player.Character:FindFirstChild("Head")
+
+        if not (Alert.Aimed and Mine) then
+            return
+        end
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = IsEnemy(Other) and Other.Character
+            local Head = Character and Character:FindFirstChild("Head")
+
+            if Head and Alive(Character) and Character:FindFirstChildOfClass("Tool") then
+                local Offset = Mine.Position - Head.Position
+                local Distance = Offset.Magnitude
+
+                if Distance <= Alert.AimedRange and Distance > 1 then
+                    local Angle = math.deg(math.acos(math.clamp(Head.CFrame.LookVector:Dot(Offset.Unit), -1, 1)))
+
+                    -- Up close the cone widens so a body-width miss still counts
+                    if Angle <= Alert.AimedCone or Distance * math.sin(math.rad(Angle)) <= 2.5 and Angle < 45 then
+                        local Ignore = {Character, Workspace.CurrentCamera}
+                        local IgnoreFolder = Workspace:FindFirstChild("Ignore")
+
+                        if IgnoreFolder then
+                            table.insert(Ignore, IgnoreFolder)
+                        end
+
+                        SightParams.FilterDescendantsInstances = Ignore
+
+                        local Result = Workspace:Raycast(Head.Position, Offset, SightParams)
+
+                        if not Result or Result.Instance:IsDescendantOf(Player.Character) then
+                            table.insert(Warnings, {("AIMED AT: %s  %d m"):format(Other.DisplayName, Meters(Distance)), RED})
+                            table.insert(Pointers, {Head.Position, RED})
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    --// Gunfire locator: every shot fired anywhere reaches every client as one BallisticsNet.ShotBroadcast packet.
+    -- ShotCodec.decodeBroadcast gives the shooter's net slot (the NetSlot attribute on their Player), the muzzle
+    -- offset from their root part and every pellet's direction, so each shot names its shooter and its line.
+
+    local Shots = {} -- Player -> {At, Position}
+    local NearMisses = {} -- Player -> time
+    local MapMarks = setmetatable({}, {__mode = "k"}) -- characters we put on the map, and until when
+    local ShotTags = Pool(NewTag)
+
+    local function BySlot(Slot)
+        for _, Other in next, Players:GetPlayers() do
+            if Other:GetAttribute("NetSlot") == Slot then
+                return Other
+            end
+        end
+    end
+
+    --// Magazine counter: the same shot packets, counted against the magazine size in the shooter's weapon config.
+    -- A reload is spotted three ways: the reload animation from that config playing on their character, the magazine
+    -- running dry (reloaded once ReloadTime has passed), or a long pause (most players top up when it goes quiet).
+
+    local Magazines = {} -- Player -> {Weapon, Fired, Size, ReloadTime, ReloadIds, EmptyAt, Last}
+    local CountRounds
+
+    local function WeaponOf(Shooter)
+        local Tool = Shooter.Character and Shooter.Character:FindFirstChildOfClass("Tool")
+        return Tool and Tool.Name
+    end
+
+    local function MagazineFor(Shooter)
+        local Weapon = WeaponOf(Shooter)
+        local Entry = Magazines[Shooter]
+
+        if not Weapon then
+            return nil
+        end
+
+        -- A new gun in hand starts a fresh count
+        if not Entry or Entry.Weapon ~= Weapon then
+            local Config = WeaponManager and select(2, pcall(WeaponManager.GetMuzzleConfig, WeaponManager, Weapon, 1))
+            local Size = type(Config) == "table" and tonumber(Config.Ammo)
+
+            if not Size then
+                Magazines[Shooter] = nil
+                return nil
+            end
+
+            local Animations = type(Config.Animations) == "table" and Config.Animations or {}
+
+            Entry = {
+                Weapon = Weapon,
+                Fired = 0,
+                Size = Size,
+                ReloadTime = tonumber(Config.ReloadTime) or 3,
+                ReloadIds = {[tostring(Animations.Reload)] = true, [tostring(Animations.ReloadUnchambered)] = true},
+                Last = os.clock()
+            }
+
+            Magazines[Shooter] = Entry
+        end
+
+        return Entry
+    end
+
+    function CountRounds(Shooter, Rounds)
+        local Entry = MagazineFor(Shooter)
+
+        if Entry then
+            Entry.Fired = math.min(Entry.Fired + Rounds, Entry.Size)
+            Entry.Last = os.clock()
+
+            if Entry.Fired >= Entry.Size and not Entry.EmptyAt then
+                Entry.EmptyAt = os.clock()
+            end
+        end
+    end
+
+    local function Reloading(Shooter, Entry)
+        local Humanoid = Shooter.Character and Shooter.Character:FindFirstChildOfClass("Humanoid")
+        local Animator = Humanoid and Humanoid:FindFirstChildOfClass("Animator")
+
+        for _, Track in next, Animator and Animator:GetPlayingAnimationTracks() or {} do
+            if Track.Animation and Entry.ReloadIds[Track.Animation.AnimationId] then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    local function OnBroadcast(Packet)
+        if not ((Alert.Gunfire or Alert.Magazines) and ShotCodec) then
+            return
+        end
+
+        local Ok, Shooters = pcall(ShotCodec.decodeBroadcast, Packet)
+        local Mine = Player.Character and Player.Character:FindFirstChild("Head")
+
+        for _, Shot in next, Ok and type(Shooters) == "table" and Shooters or {} do
+            local Shooter = BySlot(Shot.ShooterSlot)
+            local Root = Shooter and Shooter ~= Player and RootOf(Shooter.Character)
+
+            -- Magazine counter: every discharge is one round out of the shooter's magazine
+            if Root and IsEnemy(Shooter) and Alert.Magazines and type(Shot.Discharges) == "table" then
+                CountRounds(Shooter, #Shot.Discharges)
+            end
+
+            if Root and Alert.Gunfire and (IsEnemy(Shooter) or Alert.GunfireFriendly) then
+                for _, Discharge in next, type(Shot.Discharges) == "table" and Shot.Discharges or {} do
+                    local Origin = Root.Position + (typeof(Discharge.OriginOffset) == "Vector3" and Discharge.OriginOffset or Vector3.zero)
+                    Shots[Shooter] = {At = os.clock(), Position = Origin}
+
+                    -- Closest approach of each pellet's line to your head
+                    for _, Pellet in next, Mine and Alert.NearMiss and type(Discharge.Pellets) == "table" and Discharge.Pellets or {} do
+                        local Direction = type(Pellet) == "table" and (Pellet.Direction or Pellet[1]) or Pellet
+
+                        if typeof(Direction) == "Vector3" and Direction.Magnitude > 0 then
+                            local Line = Mine.Position - Origin
+                            local Along = Line:Dot(Direction.Unit)
+
+                            if Along > 0 and (Line - Direction.Unit * Along).Magnitude <= 8 then
+                                NearMisses[Shooter] = os.clock()
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local BroadcastConnection
+    local Net = ReplicatedStorage:FindFirstChild("BallisticsNet")
+    local Broadcast = Net and Net:FindFirstChild("ShotBroadcast")
+
+    if Broadcast then
+        BroadcastConnection = Broadcast.OnClientEvent:Connect(function(Packet)
+            pcall(OnBroadcast, Packet)
+        end)
+    end
+
+    local function UpdateGunfire(MyPosition)
+        local Now, Seen = os.clock(), {}
+
+        for Shooter, Shot in next, Shots do
+            local Character = Shooter.Parent and Shooter.Character
+
+            if not Alert.Gunfire or Now - Shot.At > Alert.GunfireTime or not Character then
+                Shots[Shooter] = nil
+            else
+                local Head = Character:FindFirstChild("Head") or RootOf(Character)
+
+                if Head then
+                    local Tag = ShotTags.Get(Shooter)
+                    local Enemy = IsEnemy(Shooter)
+                    Seen[Shooter] = true
+
+                    Tag.Gui.Adornee = Head
+                    Tag.Label.Text = ("FIRING  %s%s"):format(Shooter.DisplayName, MyPosition and ("  " .. Meters((Head.Position - MyPosition).Magnitude) .. " m") or "")
+                    Tag.Label.TextColor3 = Enemy and RED or BLUE
+                    Tag.Label.TextTransparency = math.clamp((Now - Shot.At) / Alert.GunfireTime, 0, 0.7)
+
+                    -- On your map too: the map draws anyone whose character carries SpottedBy
+                    if Enemy and Alert.GunfireMap and Character:GetAttribute("SpottedBy") == nil then
+                        Character:SetAttribute("SpottedBy", true)
+                        MapMarks[Character] = true
+                    end
+                end
+            end
+        end
+
+        ShotTags.Sweep(Seen)
+
+        for Shooter, At in next, NearMisses do
+            local Root = Shooter.Parent and RootOf(Shooter.Character)
+
+            if not Alert.Gunfire or not Root or Now - At > 2.5 then
+                NearMisses[Shooter] = nil
+            else
+                table.insert(Warnings, {("UNDER FIRE: %s%s"):format(Shooter.DisplayName, MyPosition and ("  " .. Meters((Root.Position - MyPosition).Magnitude) .. " m") or ""), RED})
+                table.insert(Pointers, {Root.Position, RED})
+            end
+        end
+
+        -- Map marks last as long as the tag; only our own marks are cleared, a real spot stays
+        for Character in next, MapMarks do
+            local Shooter = Players:GetPlayerFromCharacter(Character)
+
+            if not (Shooter and Seen[Shooter] and Alert.GunfireMap) then
+                if Character.Parent and Character:GetAttribute("SpottedBy") == true then
+                    Character:SetAttribute("SpottedBy", nil)
+                end
+
+                MapMarks[Character] = nil
+            end
+        end
+    end
+
+    local MagazineTags = Pool(NewTag)
+    local TurretTags = Pool(NewTag)
+    local Rigs, LastRigScan = {}, 0
+
+    local function UpdateMagazines(MyPosition)
+        local Seen, Now = {}, os.clock()
+
+        for Shooter, Entry in next, Magazines do
+            local Character = Shooter.Parent and Shooter.Character
+            local Head = Character and Character:FindFirstChild("Head")
+
+            if not (Alert.Magazines and Head and Alive(Character)) or WeaponOf(Shooter) ~= Entry.Weapon then
+                Magazines[Shooter] = nil
+            else
+                local Animating = Reloading(Shooter, Entry)
+
+                -- Ran dry and the reload time has passed, or a reload animation just finished, or a long quiet spell
+                if Entry.EmptyAt and Now - Entry.EmptyAt > Entry.ReloadTime + 0.3 or Entry.WasAnimating and not Animating or Now - Entry.Last > 8 then
+                    Entry.Fired, Entry.EmptyAt = 0, nil
+                end
+
+                Entry.WasAnimating = Animating
+
+                if MyPosition and (Head.Position - MyPosition).Magnitude <= Alert.MagazineRange then
+                    local Left = Entry.Size - Entry.Fired
+                    local Tag = MagazineTags.Get(Shooter)
+                    Seen[Shooter] = true
+
+                    Tag.Gui.Adornee = Head
+                    Tag.Gui.StudsOffset = Vector3.new(0, 4.5, 0)
+
+                    if Animating or Entry.EmptyAt then
+                        Tag.Label.Text = "RELOADING"
+                        Tag.Label.TextColor3 = RED
+                    else
+                        Tag.Label.Text = ("~%d / %d"):format(Left, Entry.Size)
+                        Tag.Label.TextColor3 = Left <= Entry.Size * 0.3 and ORANGE or WHITE
+                    end
+                end
+            end
+        end
+
+        MagazineTags.Sweep(Seen)
+
+        -- Mounted guns publish their exact count: the turret rig carries Ammo and Reloading attributes
+        local TurretSeen = {}
+
+        if Alert.Magazines and Alert.TurretAmmo then
+            local Vehicles = Workspace:FindFirstChild("Vehicles")
+
+            if Vehicles and Now - LastRigScan > 2 then
+                LastRigScan = Now
+                table.clear(Rigs)
+
+                for _, Object in next, Vehicles:GetDescendants() do
+                    if type(Object:GetAttribute("Ammo")) == "number" and (Object:IsA("Model") or Object:IsA("BasePart")) then
+                        table.insert(Rigs, Object)
+                    end
+                end
+            end
+
+            for _, Rig in next, Rigs do
+                local Anchor = Rig.Parent and (Rig:IsA("BasePart") and Rig or Rig.PrimaryPart or Rig:FindFirstChildWhichIsA("BasePart", true))
+
+                if Anchor and MyPosition and (Anchor.Position - MyPosition).Magnitude <= Alert.MagazineRange * 2 then
+                    local Tag = TurretTags.Get(Rig)
+                    TurretSeen[Rig] = true
+                    Tag.Gui.Adornee = Anchor
+                    Tag.Gui.StudsOffset = Vector3.new(0, 2, 0)
+
+                    if Rig:GetAttribute("Reloading") == true then
+                        Tag.Label.Text = Rig.Name .. "  RELOADING"
+                        Tag.Label.TextColor3 = RED
+                    else
+                        Tag.Label.Text = ("%s  %d"):format(Rig.Name, Rig:GetAttribute("Ammo"))
+                        Tag.Label.TextColor3 = WHITE
+                    end
+                end
+            end
+        end
+
+        TurretTags.Sweep(TurretSeen)
+    end
+
+    --// Blind spots: a grid of ground around you, each cell checked against every enemy's view. A cell is watched
+    -- when it sits inside an enemy's view cone (from the facing of their head) and their eyes have a clear line to
+    -- someone standing there. Red is watched, green is ground nobody is looking at right now.
+
+    local BlindCells = {}
+    local CELL = 6
+
+    local BlindParams = RaycastParams.new()
+    BlindParams.FilterType = Enum.RaycastFilterType.Exclude
+    BlindParams.IgnoreWater = true
+
+    local function Cell(Index)
+        local Box = BlindCells[Index]
+
+        if not Box then
+            Box = Instance.new("BoxHandleAdornment")
+            Box.Adornee = Workspace.Terrain
+            Box.Size = Vector3.new(CELL - 0.6, 0.15, CELL - 0.6)
+            Box.AlwaysOnTop = false
+            Box.ZIndex = 0
+            Box.Parent = Folder
+            BlindCells[Index] = Box
+        end
+
+        return Box
+    end
+
+    local function UpdateBlindSpots(MyPosition)
+        local Used = 0
+
+        if Alert.BlindSpots and MyPosition then
+            local Ignore = {Workspace.CurrentCamera}
+            local IgnoreFolder = Workspace:FindFirstChild("Ignore")
+            local Eyes = {}
+
+            if IgnoreFolder then
+                table.insert(Ignore, IgnoreFolder)
+            end
+
+            for _, Other in next, Players:GetPlayers() do
+                local Character = Other.Character
+
+                if Character then
+                    table.insert(Ignore, Character)
+                end
+
+                local Head = IsEnemy(Other) and Character and Character:FindFirstChild("Head")
+
+                if Head and Alive(Character) and (Head.Position - MyPosition).Magnitude <= Alert.BlindRadius + 500 then
+                    table.insert(Eyes, Head)
+                end
+            end
+
+            BlindParams.FilterDescendantsInstances = Ignore
+
+            local Cos = math.cos(math.rad(Alert.BlindCone))
+            local Span = math.floor(Alert.BlindRadius / CELL)
+            local Origin = Vector3.new(math.floor(MyPosition.X / CELL) * CELL, MyPosition.Y, math.floor(MyPosition.Z / CELL) * CELL)
+
+            for X = -Span, Span do
+                for Z = -Span, Span do
+                    if X * X + Z * Z <= Span * Span then
+                        local Top = Origin + Vector3.new(X * CELL, 30, Z * CELL)
+                        local Ground = Workspace:Raycast(Top, Vector3.new(0, -80, 0), BlindParams)
+
+                        if Ground then
+                            -- Someone standing there: chest height
+                            local Body = Ground.Position + Vector3.new(0, 3, 0)
+                            local Watched = false
+
+                            for _, Head in next, Eyes do
+                                local Offset = Body - Head.Position
+
+                                if Offset.Magnitude > 1 and Head.CFrame.LookVector:Dot(Offset.Unit) >= Cos and not Workspace:Raycast(Head.Position, Offset, BlindParams) then
+                                    Watched = true
+                                    break
+                                end
+                            end
+
+                            if Watched or Alert.BlindSafe then
+                                Used += 1
+
+                                local Box = Cell(Used)
+                                Box.CFrame = CFrame.new(Ground.Position + Vector3.new(0, 0.1, 0))
+                                Box.Color3 = Watched and RED or Color3.fromRGB(80, 220, 140)
+                                Box.Transparency = Watched and 0.55 or 0.75
+                                Box.Visible = true
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        for Index = Used + 1, #BlindCells do
+            BlindCells[Index].Visible = false
+        end
+    end
+
+    --// Objective pressure: who is standing on each objective right now. TriggerVolume.CapturerRoot gives the root
+    -- of anyone who counts toward a capture (on a team, alive, conscious, not disguised, not crewing a vehicle),
+    -- and TriggerVolume.Contains is the game's own inside test. Disguised enemies don't count, so they're listed apart.
+
+    local Panel = {}
+    local ObjectiveTags = Pool(NewTag)
+
+    -- Capture clock: progress sampled every half second, its rate smoothed, and the time left to a full bar
+    local Rates = setmetatable({}, {__mode = "k"})
+
+    local function Clock(Part, Value)
+        local Now, Track = os.clock(), Rates[Part]
+
+        if not Track then
+            Rates[Part] = {Value = Value, At = Now, Big = math.abs(Value) > 1}
+            return ""
+        end
+
+        Track.Big = Track.Big or math.abs(Value) > 1
+
+        if Now - Track.At >= 0.5 then
+            local Instant = (Value - Track.Value) / (Now - Track.At)
+            Track.Rate = Track.Rate and Track.Rate * 0.6 + Instant * 0.4 or Instant
+            Track.Value, Track.At = Value, Now
+        end
+
+        local Full = Track.Big and 100 or 1
+        local Rate = Track.Rate
+
+        if not Rate or math.abs(Rate) < Full * 0.002 then
+            return ""
+        end
+
+        local Left = ((Rate > 0 and Full or -Full) - Value) / Rate
+
+        if Left < 0.5 or Left > 600 then
+            return ""
+        end
+
+        return ("  %s in %d s"):format(Rate > 0 and "NATO" or "PACT", math.ceil(Left))
+    end
+
+    -- The game's own inside test, or a box test in the objective part's space when the module isn't available
+    local function Inside(Part, Root)
+        if TriggerVolume then
+            local Ok, Result = pcall(TriggerVolume.Contains, Part, Root)
+
+            if Ok then
+                return Result == true
+            end
+        end
+
+        local Local = Part.CFrame:PointToObjectSpace(Root.Position)
+        local Half = Part.Size / 2
+        return math.abs(Local.X) <= Half.X and math.abs(Local.Y) <= Half.Y and math.abs(Local.Z) <= Half.Z
+    end
+
+    -- TriggerVolume.CapturerRoot's rules: on NATO or PACT, alive, conscious, not disguised, not crewing a vehicle
+    local function Capturer(Other)
+        if TriggerVolume then
+            local Ok, Root = pcall(TriggerVolume.CapturerRoot, Other)
+
+            if Ok then
+                return Root
+            end
+        end
+
+        local Character = Other.Character
+        local Team = Other.Team and Other.Team.Name
+        local Values = Character and Character:FindFirstChild("CharacterValues")
+        local Unconscious = Values and Values:FindFirstChild("Unconscious")
+        local Root = Character and Character:FindFirstChild("HumanoidRootPart")
+
+        if (Team == "NATO" or Team == "PACT") and Root and Alive(Character) and not CollectionService:HasTag(Character, "Disguised") and not (Unconscious and Unconscious.Value) and Root.CollisionGroup ~= "CREW" then
+            return Root
+        end
+
+        return nil
+    end
+
+    -- Objectives: the game's list, or workspace.Match.Objectives read directly (ObjectValues pointing at the parts)
+    local function ObjectiveList()
+        if MatchObjectives then
+            local Ok, List = pcall(MatchObjectives.list)
+
+            if Ok and type(List) == "table" and #List > 0 then
+                return List
+            end
+        end
+
+        local Match = Workspace:FindFirstChild("Match")
+        local Folder = Match and Match:FindFirstChild("Objectives")
+        local List = {}
+
+        for _, Item in next, Folder and Folder:GetChildren() or {} do
+            if Item:IsA("ObjectValue") and Item.Value and Item.Value:IsA("BasePart") then
+                table.insert(List, {Part = Item.Value, Order = tonumber(Item:GetAttribute("Order")) or #List + 1})
+            end
+        end
+
+        table.sort(List, function(A, B) return A.Order < B.Order end)
+        return List
+    end
+
+    local function UpdateObjectives()
+        local Rows, Seen = {}, {}
+        local List = Alert.Objectives and ObjectiveList()
+
+        for _, Objective in next, type(List) == "table" and List or {} do
+            local Part = Objective.Part
+
+            if typeof(Part) == "Instance" and Part:IsA("BasePart") then
+                local Counts = {NATO = 0, PACT = 0, Spies = 0}
+
+                for _, Other in next, Players:GetPlayers() do
+                    local Root = Capturer(Other)
+
+                    if Root and Other.Team and Inside(Part, Root) then
+                        Counts[Other.Team.Name] = (Counts[Other.Team.Name] or 0) + 1
+                    elseif IsEnemy(Other) and Other.Character and CollectionService:HasTag(Other.Character, "Disguised") then
+                        local Spy = RootOf(Other.Character)
+
+                        if Spy and Alive(Other.Character) and Inside(Part, Spy) then
+                            Counts.Spies += 1
+                        end
+                    end
+                end
+
+                local Ok, Name = false, nil
+
+                if MatchObjectives then
+                    Ok, Name = pcall(MatchObjectives.displayName, Objective, Player.Team and Player.Team.Name)
+                end
+
+                local Letter = Ok and type(Name) == "string" and Name or string.char(64 + math.clamp(tonumber(Objective.Order) or 1, 1, 26))
+                local Data = Part:FindFirstChild("TriggerData")
+                local Owner = Data and Data:FindFirstChild("CapturedTeam")
+                local Progress = Data and Data:FindFirstChild("CaptureProgress")
+                local Value = Progress and tonumber(Progress.Value) or 0
+                local Held = Owner and Owner.Value and tostring(Owner.Value) or "nobody"
+
+                -- Positive progress leans NATO, negative PACT
+                local Percent = math.floor(math.abs(Value) <= 1 and math.abs(Value) * 100 or math.abs(Value))
+                local Leaning = Value > 0 and ("  NATO capping " .. Percent .. "%") or Value < 0 and ("  PACT capping " .. Percent .. "%") or ""
+                local Spies = Counts.Spies > 0 and ("  +" .. Counts.Spies .. " disguised") or ""
+                local Color = Counts.NATO > Counts.PACT and BLUE or Counts.PACT > Counts.NATO and RED or WHITE
+                local Timer = Alert.CaptureClock and Clock(Part, Value) or ""
+
+                table.insert(Rows, {("%s  [%s]  NATO %d  PACT %d%s%s%s"):format(Letter, Held, Counts.NATO, Counts.PACT, Spies, Leaning, Timer), Color})
+
+                if Alert.ObjectiveLabels then
+                    local Tag = ObjectiveTags.Get(Part)
+                    Seen[Part] = true
+                    Tag.Gui.Adornee = Part
+                    Tag.Label.Text = ("%s   NATO %d  ·  PACT %d%s%s"):format(Letter, Counts.NATO, Counts.PACT, Spies, Timer)
+                    Tag.Label.TextColor3 = Color
+                end
+            end
+        end
+
+        ObjectiveTags.Sweep(Seen)
+
+        -- A heading, so the panel is easy to find, and a line saying so when the round has no objectives
+        if Alert.Objectives then
+            table.insert(Rows, 1, {#Rows > 0 and "OBJECTIVES" or "OBJECTIVES  none this round", WHITE})
+        end
+
+        -- The side panel, left of the screen
+        for Index, Row in next, Rows do
+            local Line = DrawingOf(Panel, Index, "Text")
+
+            if Line then
+                Line.Center = false
+                Line.Size = 16
+                Line.Text = Row[1]
+                Line.Color = Row[2]
+                Line.Position = Vector2.new(16, 240 + (Index - 1) * 20)
+                Line.Visible = true
+            end
+        end
+
+        HideFrom(Panel, #Rows + 1)
+    end
+
+    --// Cards
+
+    local Strike = AlertTab:Module({
+        Title = "Strike warning",
+        Description = "Rings where artillery has been called in.",
+        Icon = "bomb",
+        Side = "Left",
+        Default = false,
+        Flag = "Alerts.Strikes",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Alert.Strikes = Value end
+    })
+
+    Strike:Checkbox({Title = "Friendly strikes", Tooltip = "Your own side's shells kill you too.", Default = true, Flag = "Alerts.Strikes.Friendly", Callback = function(Value) Alert.FriendlyStrikes = Value end})
+
+    local Grenade = AlertTab:Module({
+        Title = "Grenade warning",
+        Description = "Blast rings and fuse timers on live grenades.",
+        Icon = "circle-dot",
+        Side = "Left",
+        Default = false,
+        Flag = "Alerts.Grenades",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Alert.Grenades = Value end
+    })
+
+    Grenade:Slider({Title = "Range", Min = 20, Max = 200, Step = 5, Default = 60, Suffix = " st", Flag = "Alerts.Grenades.Range", Callback = function(Value) Alert.GrenadeRange = Value end})
+
+    local Aimed = AlertTab:Module({
+        Title = "Aimed-at warning",
+        Description = "Warns when an enemy with a clear line has you in their sights.",
+        Icon = "scan-eye",
+        Side = "Right",
+        Default = false,
+        Flag = "Alerts.Aimed",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Alert.Aimed = Value end
+    })
+
+    Aimed:Slider({Title = "Cone", Min = 1, Max = 15, Step = 1, Default = 4, Suffix = "°", Flag = "Alerts.Aimed.Cone", Tooltip = "How close to your head their aim has to be.", Callback = function(Value) Alert.AimedCone = Value end})
+    Aimed:Slider({Title = "Range", Min = 100, Max = 3000, Step = 50, Default = 800, Suffix = " st", Flag = "Alerts.Aimed.Range", Callback = function(Value) Alert.AimedRange = Value end})
+
+    local Blind = AlertTab:Module({
+        Title = "Blind spots",
+        Description = "Red ground is in an enemy's view, green is ground nobody is watching.",
+        Icon = "eye-off",
+        Side = "Left",
+        Default = false,
+        Flag = "Alerts.BlindSpots",
+        Keybind = {Key = nil, Mode = "Toggle"},
+        Opened = true,
+        Callback = function(Value) Alert.BlindSpots = Value end
+    })
+
+    Blind:Slider({Title = "Radius", Min = 24, Max = 120, Step = 6, Default = 60, Suffix = " st", Flag = "Alerts.BlindSpots.Radius", Tooltip = "Bigger costs more frames.", Callback = function(Value) Alert.BlindRadius = Value end})
+    Blind:Slider({Title = "Their view", Min = 20, Max = 90, Step = 5, Default = 60, Suffix = "°", Flag = "Alerts.BlindSpots.Cone", Tooltip = "How far off their facing an enemy still counts as seeing.", Callback = function(Value) Alert.BlindCone = Value end})
+    Blind:Checkbox({Title = "Show safe ground", Default = true, Flag = "Alerts.BlindSpots.Safe", Callback = function(Value) Alert.BlindSafe = Value end})
+
+    local Screen = AlertTab:Section({Title = "Screen", Icon = "monitor", Side = "Right"})
+    Screen:Toggle({Title = "Direction arrows", Tooltip = "Arrows around the crosshair point at each threat.", Default = true, Flag = "Alerts.Arrows", Callback = function(Value) Alert.Arrows = Value end})
+
+    local Gunfire = IntelTab:Module({
+        Title = "Gunfire locator",
+        Description = "Tags whoever just fired, wherever they are.",
+        Icon = "volume-2",
+        Side = "Left",
+        Default = false,
+        Flag = "Intel.Gunfire",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value)
+            Alert.Gunfire = Value
+
+            if Value and not (Broadcast and ShotCodec) then
+                Notify("Gunfire locator", "Couldn't find the shot broadcast in this build.", "Error", 5)
+            end
+        end
+    })
+
+    Gunfire:Slider({Title = "Show for", Min = 2, Max = 20, Step = 1, Default = 5, Suffix = " s", Flag = "Intel.Gunfire.Time", Callback = function(Value) Alert.GunfireTime = Value end})
+    Gunfire:Checkbox({Title = "Near-miss alert", Tooltip = "Warns and points at whoever's shots pass close to you.", Default = true, Flag = "Intel.Gunfire.NearMiss", Callback = function(Value) Alert.NearMiss = Value end})
+    Gunfire:Checkbox({Title = "Mark on map", Tooltip = "Shooters show on your map while tagged.", Default = true, Flag = "Intel.Gunfire.Map", Callback = function(Value) Alert.GunfireMap = Value end})
+    Gunfire:Checkbox({Title = "Friendly shots", Default = false, Flag = "Intel.Gunfire.Friendly", Callback = function(Value) Alert.GunfireFriendly = Value end})
+
+    local MagazineCard = IntelTab:Module({
+        Title = "Magazine counter",
+        Description = "Rounds left in each enemy's magazine, and when they're reloading.",
+        Icon = "layers",
+        Side = "Left",
+        Default = false,
+        Flag = "Intel.Magazines",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value)
+            Alert.Magazines = Value
+
+            if Value and not (Broadcast and ShotCodec) then
+                Notify("Magazine counter", "Couldn't find the shot broadcast in this build.", "Error", 5)
+            end
+        end
+    })
+
+    MagazineCard:Slider({Title = "Range", Min = 50, Max = 1500, Step = 50, Default = 400, Suffix = " st", Flag = "Intel.Magazines.Range", Callback = function(Value) Alert.MagazineRange = Value end})
+    MagazineCard:Checkbox({Title = "Vehicle guns", Tooltip = "Exact rounds left on mounted guns.", Default = true, Flag = "Intel.Magazines.Turrets", Callback = function(Value) Alert.TurretAmmo = Value end})
+
+    local Pressure = IntelTab:Module({
+        Title = "Objective pressure",
+        Description = "Live head count on every objective.",
+        Icon = "flag",
+        Side = "Right",
+        Default = false,
+        Flag = "Intel.Objectives",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Alert.Objectives = Value end
+    })
+
+    Pressure:Checkbox({Title = "Capture clock", Tooltip = "Seconds until the bar fills at the current pace.", Default = true, Flag = "Intel.Objectives.Clock", Callback = function(Value) Alert.CaptureClock = Value end})
+    Pressure:Checkbox({Title = "Labels on objectives", Default = true, Flag = "Intel.Objectives.Labels", Callback = function(Value) Alert.ObjectiveLabels = Value end})
+
+    --// Loops
+
+    local BlindTick = 0
+
+    task.spawn(function()
+        while Running do
+            table.clear(Warnings)
+            table.clear(Pointers)
+
+            local Root = RootOf(Player.Character)
+            local MyPosition = Root and Root.Position
+
+            for _, Step in next, {UpdateStrikes, UpdateGrenades, UpdateAimed, UpdateGunfire, UpdateMagazines, UpdateObjectives} do
+                pcall(Step, MyPosition)
+            end
+
+            -- The grid is the heaviest check, so it runs twice a second
+            BlindTick = (BlindTick + 1) % 5
+
+            if BlindTick == 0 or not Alert.BlindSpots then
+                pcall(UpdateBlindSpots, MyPosition)
+            end
+
+            pcall(DrawWarnings)
+            task.wait(0.1)
+        end
+    end)
+
+    local ArrowLoop = RunService.RenderStepped:Connect(function()
+        pcall(DrawArrows)
+    end)
+
+    OasisUI:OnUnload(function()
+        Running = false
+        ArrowLoop:Disconnect()
+
+        if BroadcastConnection then
+            BroadcastConnection:Disconnect()
+        end
+
+        for Character in next, MapMarks do
+            if Character.Parent and Character:GetAttribute("SpottedBy") == true then
+                Character:SetAttribute("SpottedBy", nil)
+            end
+        end
+
+        for _, List in next, {Lines, Arrows, Panel} do
+            for _, Object in next, List do
+                pcall(Object.Remove, Object)
+            end
+        end
+
+        Folder:Destroy()
+    end)
+end
+
+--// Dive: water stops every bullet. Interactions.resolve ends a bullet the moment its ray touches water, and the
+-- shooter's raycast doesn't ignore water. The game's own swim (Client.Character.SurfaceSwim) asks its
+-- _probeSurface method where the surface is and holds your root 0.75 studs under that. Answering with a surface a
+-- few studs lower makes the game itself hold you under; nothing fights it. There's no drowning in the client code.
+-- You can't use weapons while swimming, so this is for crossing water or waiting a fight out.
+
+do
+    local Running = true
+    local Dive = {Enabled = false, Depth = 4}
+    local Swimmer -- the game's SurfaceSwim object for your current character
+
+    -- Found by shape: the table holding your character with the swim's own fields
+    local function FindSwimmer()
+        local Character = Player.Character
+
+        if Swimmer and rawget(Swimmer, "_character") == Character then
+            return Swimmer
+        end
+
+        Swimmer = nil
+
+        if not (getgc and Character) then
+            return nil
+        end
+
+        for _, Value in next, getgc(true) do
+            if type(Value) == "table" and rawget(Value, "_character") == Character and rawget(Value, "_feetOffset") ~= nil then
+                Swimmer = Value
+                break
+            end
+        end
+
+        return Swimmer
+    end
+
+    local function Surfacing()
+        return UserInputService:IsKeyDown(Enum.KeyCode.Space) and not UserInputService:GetFocusedTextBox()
+    end
+
+    local Patched = setmetatable({}, {__mode = "k"})
+
+    local function Patch(Object)
+        local Class = getmetatable(Object)
+        local Original = type(Class) == "table" and rawget(Class, "_probeSurface")
+
+        if Patched[Object] or type(Original) ~= "function" then
+            return
+        end
+
+        Patched[Object] = true
+
+        -- Read through the instance first, so this shadows the class method for your character only
+        rawset(Object, "_probeSurface", function(Self, ...)
+            local Surface = Original(Self, ...)
+
+            if Surface and Running and Dive.Enabled and not Surfacing() then
+                return Surface - Dive.Depth
+            end
+
+            return Surface
+        end)
+    end
+
+    local Status = Drawing and Drawing.new("Text")
+
+    if Status then
+        Status.Visible = false
+        Status.Center = true
+        Status.Outline = true
+        Status.Size = 18
+        Status.Font = 2
+        Status.Color = Color3.fromRGB(80, 220, 140)
+    end
+
+    task.spawn(function()
+        while Running do
+            local Under = false
+
+            if Dive.Enabled then
+                pcall(function()
+                    local Object = FindSwimmer()
+
+                    if Object then
+                        Patch(Object)
+
+                        -- The real surface stays in _surfaceY; the head is under when its top is below it
+                        local Head = Player.Character:FindFirstChild("Head")
+                        local Surface = rawget(Object, "_surfaceY")
+                        Under = rawget(Object, "_swimming") == true and Head ~= nil and type(Surface) == "number" and Head.Position.Y + Head.Size.Y / 2 < Surface - 0.3
+                    end
+                end)
+            end
+
+            if Status then
+                Status.Visible = Under
+
+                if Under then
+                    Status.Text = "UNDER WATER: bullets can't reach you"
+                    Status.Position = Vector2.new(Workspace.CurrentCamera.ViewportSize.X / 2, 64)
+                end
+            end
+
+            task.wait(0.25)
+        end
+    end)
+
+    local Card = MoveTab:Module({
+        Title = "Dive",
+        Description = "Swim into deep water and you stay under, where no bullet reaches. Hold Space to come up.",
+        Icon = "waves",
+        Side = "Left",
+        Default = false,
+        Flag = "Movement.Dive",
+        Keybind = {Key = nil, Mode = "Toggle"},
+        Opened = true,
+        Callback = function(Value)
+            Dive.Enabled = Value
+
+            if Value and not getgc then
+                Notify("Dive", "Your executor is missing getgc, so Dive can't find the game's swim.", "Error", 5)
+            end
+        end
+    })
+
+    Card:Slider({Title = "Depth", Min = 2, Max = 15, Step = 0.5, Default = 4, Suffix = " st", Flag = "Movement.Dive.Depth", Tooltip = "How far under the surface you're held. Needs water at least this deep.", Callback = function(Value) Dive.Depth = Value end})
+
+    OasisUI:OnUnload(function()
+        Running = false
+
+        if Status then
+            Status:Remove()
+        end
+    end)
+end
+
+--// Grenade arc and smoke planner.
+-- The throw is made on the server (Remotes.Grenade "Throw" with your camera's facing, sent 0.2 s after you let go,
+-- and the stance), so its speed and release point aren't in the client. They're learned instead: when your own
+-- grenade appears in workspace.Ignore.Dropped, its first position is stored relative to your head and its starting
+-- velocity is split into speed along your aim plus an upward kick, per stance. Its physical properties are read off
+-- the same part, so the bounces use the grenade's real elasticity and friction against whatever it hits.
+
+do
+    local Running = true
+    local Arc = {Enabled = false, Always = false, Smoke = false, Shield = "Me", Cloud = 12}
+    local GrenadeConfigs = Shared and Shared:FindFirstChild("GrenadeConfigManager")
+    local MatchObjectives = Require(Shared and Shared:FindFirstChild("MatchObjectives"))
+
+    -- Starting guesses until your first throw of each stance; Offset is the release point in your facing's frame
+    local Learned = {
+        High = {Speed = 65, Lift = 8, Offset = Vector3.new(0.8, 0.2, -1), Guess = true},
+        Low = {Speed = 30, Lift = 4, Offset = Vector3.new(0.8, -1, -1), Guess = true}
+    }
+
+    -- Plastic's defaults until a real grenade has been seen
+    local Body = {Elasticity = 0.5, Friction = 0.3, ElasticityWeight = 1, FrictionWeight = 1, Radius = 0.4}
+    local Pending -- the last throw: {At, Look, Head, Stance}
+
+    -- The grenade tool's own state table (aiming, currentStance, tool), found by shape
+    local States = setmetatable({}, {__mode = "k"})
+    local LastScan = 0
+
+    local function StateOf(Tool)
+        if States[Tool] or not getgc or os.clock() - LastScan < 2 then
+            return States[Tool]
+        end
+
+        LastScan = os.clock()
+
+        for _, Value in next, getgc(true) do
+            if type(Value) == "table" and rawget(Value, "currentStance") ~= nil and rawget(Value, "tool") == Tool then
+                States[Tool] = Value
+                break
+            end
+        end
+
+        return States[Tool]
+    end
+
+    local Configs = {}
+
+    -- Fuse, type and kill radius per grenade
+    local function ConfigOf(Name)
+        if not Configs[Name] then
+            local Config = Require(GrenadeConfigs and GrenadeConfigs:FindFirstChild(Name))
+            local Blast = type(Config) == "table" and type(Config.explosionSettings) == "table" and Config.explosionSettings
+
+            Configs[Name] = {
+                Type = type(Config) == "table" and Config.Type or "Frag",
+                Fuze = type(Config) == "table" and tonumber(Config.Fuze) or 4,
+                Kill = Blast and tonumber(Blast.KillRange) or 2
+            }
+        end
+
+        return Configs[Name]
+    end
+
+    local function HeldGrenade()
+        local Character = Player.Character
+        local Tool = Character and Character:FindFirstChildOfClass("Tool")
+        return Tool and GrenadeConfigs and GrenadeConfigs:FindFirstChild(Tool.Name) and Tool or nil
+    end
+
+    local function Mine(Part)
+        local Owner = Part:GetAttribute("Owner")
+        return Owner == Player.UserId or Owner == Player.Name or Owner == tostring(Player.UserId)
+    end
+
+    -- Your facing with the pitch taken out: the frame the release point is stored in
+    local function Facing(Head, Look)
+        local Flat = Vector3.new(Look.X, 0, Look.Z)
+        Flat = Flat.Magnitude > 1e-3 and Flat.Unit or Vector3.new(0, 0, -1)
+        return CFrame.lookAt(Head, Head + Flat)
+    end
+
+    -- Velocity = Speed * Look + Lift * Up, solved for Speed and Lift by least squares
+    local function Learn(Velocity, Spawn, Throw)
+        local Look, Lean = Throw.Look, Throw.Look.Y
+        local Det = 1 - Lean * Lean
+        local Along, Up = Velocity:Dot(Look), Velocity.Y
+        local Speed, Lift
+
+        if Det < 0.05 then
+            Speed, Lift = Along, 0
+        else
+            Speed = (Along - Lean * Up) / Det
+            Lift = (Up - Lean * Along) / Det
+        end
+
+        if not (Speed > 5 and Speed < 400) then
+            return
+        end
+
+        local Offset = Facing(Throw.Head, Look):PointToObjectSpace(Spawn)
+        local Old = Learned[Throw.Stance]
+
+        -- Averaged with earlier throws once there's a real one to average with
+        if Old.Guess then
+            Learned[Throw.Stance] = {Speed = Speed, Lift = Lift, Offset = Offset}
+            Notify("Grenade arc", ("Learned your %s throw from that grenade."):format(Throw.Stance:lower()), "Info", 3)
+        else
+            Learned[Throw.Stance] = {Speed = (Old.Speed + Speed) / 2, Lift = (Old.Lift + Lift) / 2, Offset = Old.Offset:Lerp(Offset, 0.5)}
+        end
+    end
+
+    local function WatchDropped(Dropped)
+        return Dropped.ChildAdded:Connect(function(Part)
+            local Throw = Pending
+
+            if not (Part:IsA("BasePart") and Throw and os.clock() - Throw.At < 2.5) then
+                return
+            end
+
+            -- Its first replicated position, before it has moved far
+            local Spawn, SeenAt = Part.Position, os.clock()
+            task.wait()
+
+            if not (Mine(Part) or (Spawn - Throw.Head).Magnitude < 12) then
+                return
+            end
+
+            local Properties = Part.CurrentPhysicalProperties
+            Body = {
+                Elasticity = Properties.Elasticity,
+                Friction = Properties.Friction,
+                ElasticityWeight = Properties.ElasticityWeight,
+                FrictionWeight = Properties.FrictionWeight,
+                Radius = math.min(Part.Size.X, Part.Size.Y, Part.Size.Z) / 2
+            }
+
+            -- The velocity can take a frame or two to show up; gravity since the first sighting is taken back out
+            for _ = 1, 6 do
+                local Velocity = Part.AssemblyLinearVelocity
+
+                if Velocity.Magnitude > 2 then
+                    Pending = nil
+                    return Learn(Velocity + Vector3.new(0, Workspace.Gravity * (os.clock() - SeenAt), 0), Spawn, Throw)
+                end
+
+                RunService.Heartbeat:Wait()
+            end
+        end)
+    end
+
+    local DroppedConnection
+
+    task.spawn(function()
+        local Ignore = Workspace:WaitForChild("Ignore", 30)
+        local Dropped = Ignore and Ignore:WaitForChild("Dropped", 30)
+
+        if Dropped and Running then
+            DroppedConnection = WatchDropped(Dropped)
+        end
+    end)
+
+    --// Flight: gravity, then on each contact the normal speed is reversed and scaled by the combined elasticity,
+    -- and friction takes speed off along the surface (Roblox mixes two parts' values by their weights)
+
+    local ArcParams = RaycastParams.new()
+    ArcParams.FilterType = Enum.RaycastFilterType.Exclude
+    ArcParams.IgnoreWater = false
+
+    local function SurfaceOf(Result)
+        local Hit = Result.Instance
+
+        if Hit:IsA("BasePart") and Hit ~= Workspace.Terrain then
+            return Hit.CurrentPhysicalProperties
+        end
+
+        return PhysicalProperties.new(Result.Material)
+    end
+
+    local function Mix(A, WeightA, B, WeightB)
+        return (A * WeightA + B * WeightB) / math.max(WeightA + WeightB, 1e-3)
+    end
+
+    local STEP, MAX_STEPS = 1 / 30, 150
+
+    -- Returns the path points and where it goes off (or comes to rest)
+    local function Fly(Start, Velocity, Config)
+        local Points = {Start}
+        local Position = Start
+        local Gravity = Vector3.new(0, -Workspace.Gravity, 0)
+        local Limit = Config.Type == "Smoke" and 5 or Config.Fuze
+
+        for Step = 1, MAX_STEPS do
+            if Step * STEP > Limit then
+                break
+            end
+
+            local Next = Position + Velocity * STEP + 0.5 * Gravity * STEP * STEP
+            local Result = Workspace:Raycast(Position, Next - Position, ArcParams)
+            Velocity += Gravity * STEP
+
+            if Result then
+                table.insert(Points, Result.Position)
+
+                -- Impact grenades go off on the first hit; water swallows anything
+                if Config.Type == "Impact" or Result.Material == Enum.Material.Water then
+                    return Points, Result.Position
+                end
+
+                local Surface = SurfaceOf(Result)
+                local Bounce = Mix(Body.Elasticity, Body.ElasticityWeight, Surface.Elasticity, Surface.ElasticityWeight)
+                local Grip = Mix(Body.Friction, Body.FrictionWeight, Surface.Friction, Surface.FrictionWeight)
+                local Normal = Result.Normal
+                local Into = Velocity:Dot(Normal)
+                local Across = Velocity - Normal * Into
+
+                -- Friction can only stop the sliding, never reverse it
+                local Slow = Across.Magnitude > 1e-3 and math.min(1, Grip * (1 + Bounce) * math.abs(Into) / Across.Magnitude) or 1
+                Velocity = Across * (1 - Slow) - Normal * Into * Bounce
+                Position = Result.Position + Normal * Body.Radius
+
+                -- Settled on the ground
+                if Velocity.Magnitude < 1.5 and Normal.Y > 0.7 then
+                    return Points, Result.Position
+                end
+            else
+                Position = Next
+                table.insert(Points, Position)
+            end
+        end
+
+        return Points, Position
+    end
+
+    --// Smoke planner: where one smoke cloud cuts the most enemy sightlines onto you or the nearest objective.
+    -- Every enemy with a clear line to the spot you're shielding is a line; the best cloud sits across the most of
+    -- them, on ground you can throw to.
+
+    local function ShieldPoint()
+        local Root = Player.Character and Player.Character:FindFirstChild("HumanoidRootPart")
+
+        if not Root then
+            return nil
+        end
+
+        if Arc.Shield == "Nearest objective" and MatchObjectives then
+            local Ok, List = pcall(MatchObjectives.list)
+            local Best, BestGap
+
+            for _, Objective in next, Ok and type(List) == "table" and List or {} do
+                local Part = Objective.Part
+
+                if typeof(Part) == "Instance" and Part:IsA("BasePart") then
+                    local Gap = (Part.Position - Root.Position).Magnitude
+
+                    if not BestGap or Gap < BestGap then
+                        Best, BestGap = Part.Position, Gap
+                    end
+                end
+            end
+
+            return Best
+        end
+
+        return Root.Position
+    end
+
+    local function DistanceToSegment(Point, A, B)
+        local Line = B - A
+        local Along = math.clamp((Point - A):Dot(Line) / math.max(Line:Dot(Line), 1e-6), 0, 1)
+        return (Point - (A + Line * Along)).Magnitude
+    end
+
+    local SightParams = RaycastParams.new()
+    SightParams.FilterType = Enum.RaycastFilterType.Exclude
+    SightParams.IgnoreWater = true
+
+    local function PlanSmoke(Head)
+        local Target = ShieldPoint()
+
+        if not Target then
+            return nil
+        end
+
+        Target += Vector3.new(0, 2, 0)
+
+        local Ignore = {Workspace.CurrentCamera}
+        local IgnoreFolder = Workspace:FindFirstChild("Ignore")
+
+        if IgnoreFolder then
+            table.insert(Ignore, IgnoreFolder)
+        end
+
+        for _, Other in next, Players:GetPlayers() do
+            if Other.Character then
+                table.insert(Ignore, Other.Character)
+            end
+        end
+
+        SightParams.FilterDescendantsInstances = Ignore
+
+        -- Sightlines: enemy eyes with a clear view of the spot
+        local Lines = {}
+
+        for _, Other in next, Players:GetPlayers() do
+            local Character = Other ~= Player and Other.Team and Player.Team and Other.Team ~= Player.Team and Other.Character
+            local Eye = Character and Character:FindFirstChild("Head")
+            local Humanoid = Character and Character:FindFirstChildOfClass("Humanoid")
+
+            if Eye and Humanoid and Humanoid.Health > 0 and (Eye.Position - Target).Magnitude < 800 and not Workspace:Raycast(Eye.Position, Target - Eye.Position, SightParams) then
+                table.insert(Lines, {Eye.Position, Target})
+            end
+        end
+
+        if #Lines == 0 then
+            return nil
+        end
+
+        local Best
+
+        for _, Line in next, Lines do
+            for Step = 1, 9 do
+                local Along = Line[2]:Lerp(Line[1], Step / 10)
+                local Down = Workspace:Raycast(Along + Vector3.new(0, 20, 0), Vector3.new(0, -80, 0), SightParams)
+
+                -- Within a throw of you
+                if Down and (Down.Position - Head).Magnitude <= 70 then
+                    -- The cloud sits on the ground and rises; count lines passing through it at head height
+                    local Cloud = Down.Position + Vector3.new(0, 4, 0)
+                    local Blocked = 0
+
+                    for _, Other in next, Lines do
+                        if DistanceToSegment(Cloud, Other[1], Other[2]) <= Arc.Cloud then
+                            Blocked += 1
+                        end
+                    end
+
+                    -- Ties go to the spot nearer you: a shorter, surer throw
+                    local Score = Blocked - (Down.Position - Head).Magnitude / 1000
+
+                    if not Best or Score > Best.Score then
+                        Best = {Point = Down.Position, Blocked = Blocked, Of = #Lines, Score = Score}
+                    end
+                end
+            end
+        end
+
+        return Best
+    end
+
+    --// Drawing
+
+    local Segments = {}
+
+    for Index = 1, MAX_STEPS do
+        local Line = Drawing and Drawing.new("Line")
+
+        if Line then
+            Line.Visible = false
+            Line.Thickness = 2
+            Line.Transparency = 0.9
+        end
+
+        Segments[Index] = Line
+    end
+
+    local function NewRing(Color)
+        local Ring = Instance.new("CylinderHandleAdornment")
+        Ring.Adornee = Workspace.Terrain
+        Ring.Height = 0.2
+        Ring.Color3 = Color
+        Ring.Transparency = 0.3
+        Ring.AlwaysOnTop = true
+        Ring.Visible = false
+        Ring.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+        return Ring
+    end
+
+    local function PlaceRing(Ring, Position, Radius)
+        Ring.Radius = Radius
+        Ring.InnerRadius = math.max(Radius - 0.6, 0)
+        Ring.CFrame = CFrame.new(Position) * CFrame.Angles(math.rad(90), 0, 0)
+        Ring.Visible = true
+    end
+
+    local Landing = NewRing(Color3.fromRGB(255, 80, 80))
+    local SmokeRing = NewRing(Color3.fromRGB(235, 235, 235))
+
+    local Label = Drawing and Drawing.new("Text")
+
+    if Label then
+        Label.Visible = false
+        Label.Center = true
+        Label.Outline = true
+        Label.Size = 16
+        Label.Font = 2
+    end
+
+    local Aiming, SmokePlan, LastPlan = false, nil, 0
+
+    local function Step()
+        local Camera = Workspace.CurrentCamera
+        local Tool = Arc.Enabled and HeldGrenade()
+        local State = Tool and StateOf(Tool)
+        local Stance = State and State.currentStance == "Low" and "Low" or "High"
+        local Now = State and State.aiming == true
+        local Head = Player.Character and Player.Character:FindFirstChild("Head")
+
+        -- Releasing the throw: the server reads your camera 0.2 s later
+        if Aiming and not Now and Tool then
+            task.delay(0.2, function()
+                local Current = Player.Character and Player.Character:FindFirstChild("Head")
+
+                if Current then
+                    Pending = {At = os.clock(), Look = Workspace.CurrentCamera.CFrame.LookVector, Head = Current.Position, Stance = Stance}
+                end
+            end)
+        end
+
+        Aiming = Now
+
+        local Show = Tool and Head and (Now or Arc.Always or not State)
+        local Used, Text, TextAt, TextColor = 0, nil, nil, nil
+
+        Landing.Visible = false
+        SmokeRing.Visible = false
+
+        if Show then
+            local Config = ConfigOf(Tool.Name)
+            local Look = Camera.CFrame.LookVector
+            local Throw = Learned[Stance]
+            local Start = Facing(Head.Position, Look):PointToWorldSpace(Throw.Offset)
+            local Ignore = {Player.Character, Camera}
+            local IgnoreFolder = Workspace:FindFirstChild("Ignore")
+
+            if IgnoreFolder then
+                table.insert(Ignore, IgnoreFolder)
+            end
+
+            ArcParams.FilterDescendantsInstances = Ignore
+
+            local Points, Stop = Fly(Start, Look * Throw.Speed + Vector3.yAxis * Throw.Lift, Config)
+
+            for Index = 1, #Points - 1 do
+                local Line = Segments[Index]
+
+                if Line then
+                    local A, OnA = Camera:WorldToViewportPoint(Points[Index])
+                    local B, OnB = Camera:WorldToViewportPoint(Points[Index + 1])
+                    Line.Visible = A.Z > 0 and B.Z > 0 and (OnA or OnB)
+                    Line.From = Vector2.new(A.X, A.Y)
+                    Line.To = Vector2.new(B.X, B.Y)
+                    Line.Color = Throw.Guess and Color3.fromRGB(255, 210, 60) or Color3.fromRGB(255, 120, 80)
+                    Used = Index
+                end
+            end
+
+            PlaceRing(Landing, Stop, Config.Type == "Smoke" and Arc.Cloud or Config.Kill)
+            Landing.Color3 = Config.Type == "Smoke" and Color3.fromRGB(150, 150, 150) or Throw.Guess and Color3.fromRGB(255, 210, 60) or Color3.fromRGB(255, 80, 80)
+
+            -- Smoke in hand: where to put it, and whether this throw gets there
+            if Arc.Smoke and Config.Type == "Smoke" then
+                if os.clock() - LastPlan > 0.25 then
+                    LastPlan = os.clock()
+                    SmokePlan = PlanSmoke(Head.Position)
+                end
+
+                if SmokePlan then
+                    PlaceRing(SmokeRing, SmokePlan.Point, Arc.Cloud)
+
+                    local OnTarget = (Vector3.new(Stop.X, 0, Stop.Z) - Vector3.new(SmokePlan.Point.X, 0, SmokePlan.Point.Z)).Magnitude <= 4
+                    SmokeRing.Color3 = OnTarget and Color3.fromRGB(80, 220, 140) or Color3.fromRGB(235, 235, 235)
+                    Text = OnTarget and "THROW" or ("SMOKE HERE  blocks %d of %d"):format(SmokePlan.Blocked, SmokePlan.Of)
+                    TextAt, TextColor = SmokePlan.Point + Vector3.new(0, 4, 0), SmokeRing.Color3
+                end
+            end
+        end
+
+        for Index = Used + 1, MAX_STEPS do
+            if Segments[Index] then
+                Segments[Index].Visible = false
+            end
+        end
+
+        if Label then
+            local Screen, OnScreen
+
+            if TextAt then
+                Screen, OnScreen = Camera:WorldToViewportPoint(TextAt)
+            end
+
+            Label.Visible = OnScreen == true
+
+            if OnScreen then
+                Label.Text = Text
+                Label.Color = TextColor
+                Label.Position = Vector2.new(Screen.X, Screen.Y)
+            end
+        end
+    end
+
+    local Connection = RunService.RenderStepped:Connect(function()
+        if Running then
+            pcall(Step)
+        end
+    end)
+
+    local Card = GunsTab:Module({
+        Title = "Grenade arc",
+        Description = "Your throw's path with bounces, and where it goes off. Yellow: estimate until your first throw teaches it.",
+        Icon = "circle-dot",
+        Side = "Right",
+        Default = false,
+        Flag = "Guns.GrenadeArc",
+        Keybind = false,
+        Opened = true,
+        Callback = function(Value) Arc.Enabled = Value end
+    })
+
+    Card:Checkbox({Title = "Show while held", Tooltip = "Draw it the whole time a grenade is out, not just while winding up.", Default = false, Flag = "Guns.GrenadeArc.Always", Callback = function(Value) Arc.Always = Value end})
+    Card:Checkbox({Title = "Smoke planner", Tooltip = "With smoke in hand, marks where one cloud blocks the most enemy sightlines. Turns green when your throw lands there.", Default = true, Flag = "Guns.SmokePlanner", Callback = function(Value) Arc.Smoke = Value end})
+    Card:Dropdown({Title = "Shield", Values = {"Me", "Nearest objective"}, Default = "Me", Flag = "Guns.SmokePlanner.Shield", Callback = function(Value) Arc.Shield = Value end})
+    Card:Slider({Title = "Cloud size", Min = 6, Max = 30, Step = 1, Default = 12, Suffix = " st", Flag = "Guns.SmokePlanner.Cloud", Tooltip = "Radius of a settled smoke cloud.", Callback = function(Value) Arc.Cloud = Value end})
+
+    OasisUI:OnUnload(function()
+        Running = false
+        Connection:Disconnect()
+
+        if DroppedConnection then
+            DroppedConnection:Disconnect()
+        end
+
+        for _, Line in next, Segments do
+            if Line then
+                Line:Remove()
+            end
+        end
+
+        if Label then
+            Label:Remove()
+        end
+
+        Landing:Destroy()
+        SmokeRing:Destroy()
     end)
 end
 
